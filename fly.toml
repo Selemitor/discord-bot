@@ -6,8 +6,9 @@
 app = 'discord-purple-cloud-8641'
 primary_region = 'fra'
 
-[build]
 
+[processes]
+  app = "python bot.py"
 
 
 [[vm]]
