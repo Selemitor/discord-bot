@@ -1,0 +1,35 @@
+name: Fly Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy Bot
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Pobiera kod z Twojego repozytorium
+      - uses: actions/checkout@v4
+
+      # 2. Ręcznie instaluje najnowszą wersję flyctl
+      - name: Install flyctl
+        run: |
+          curl -L https://fly.io/install.sh | sh
+          echo "$HOME/.fly/bin" >> $GITHUB_PATH
+
+      # 3. KROK KRYTYCZNY: Ustawia sekrety na Fly.io (na podstawie sekretów z GitHub)
+      - name: Set Fly.io Secrets
+        run: |
+          flyctl secrets set BOT_TOKEN="${{ secrets.BOT_TOKEN }}"
+          flyctl secrets set COINGECKO_API_KEY="${{ secrets.COINGECKO_API_KEY }}"
+          flyctl secrets set ALPHAVANTAGE_API_KEY="${{ secrets.ALPHAVANTAGE_API_KEY }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      # 4. Wdraża aplikację na Fly.io
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
