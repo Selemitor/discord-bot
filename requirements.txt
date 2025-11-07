@@ -5,4 +5,4 @@ deep-translator
 numpy
 beautifulsoup4
 google-genai
-# Ten komentarz wymusza ponowne budowanie
+# Ten komentarz wymusza ponowne budowanie1
