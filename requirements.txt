@@ -4,3 +4,4 @@ feedparser
 deep-translator
 numpy
 beautifulsoup4
+google-genai
