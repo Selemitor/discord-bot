@@ -10,7 +10,6 @@ primary_region = 'fra'
 [processes]
   app = "python bot.py"
 
-
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
