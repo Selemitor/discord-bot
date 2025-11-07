@@ -1,5 +1,5 @@
-import discord
 import os
+import discord
 from discord.ext import commands, tasks
 import requests
 import datetime
@@ -8,27 +8,25 @@ import csv
 import io
 import feedparser
 import time
-from deep_translator import GoogleTranslator
 from zoneinfo import ZoneInfo
 import numpy as np
 from bs4 import BeautifulSoup
+from collections import deque
+import asyncio
+# Wymaga instalacji: google-genai
+import google.generativeai as genai
 
 # --- Konfiguracja ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY')
 ALPHAVANTAGE_API_KEY = os.environ.get('ALPHAVANTAGE_API_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') # NOWY KLUCZ Z FLY.IO
 
-# Sprawdzenie, czy tokeny istnieją
 if not BOT_TOKEN:
-    print("BŁĄD: Nie znaleziono BOT_TOKEN. Ustaw go w sekretach Fly.io!")
+    print("BŁĄD: Nie znaleziono BOT_TOKEN. Aplikacja nie wystartuje.")
     exit()
-if not COINGECKO_API_KEY:
-    print("OSTRZEŻENIE: Nie znaleziono COINGECKO_API_KEY.")
-if not ALPHAVANTAGE_API_KEY:
-    print("OSTRZEŻENIE: Nie znaleziono ALPHAVANTAGE_API_KEY.")
 
-
-# Uzupełnij ID swoich kanałów
+# Upewnij się, że te ID są poprawne
 CHANNEL_ID = 1429744335389458452
 WATCHER_GURU_CHANNEL_ID = 1429719129702535248 
 FIN_WATCH_CHANNEL_ID = 1429719129702535248
@@ -36,56 +34,106 @@ FIN_WATCH_CHANNEL_ID = 1429719129702535248
 WATCHER_GURU_RSS_URL = "https://rss.app/feeds/bP1lIE9lQ9hTBuSk.xml"
 FIN_WATCH_RSS_URL = "https://rss.app/feeds/R0DJZuoPNWe5yCMY.xml"
 
-WATCHER_GURU_SENT_URLS = set()
-FIN_WATCH_SENT_URLS = set()
-TZ_POLAND = ZoneInfo("Europe/Warsaw")
+# Używamy deque do bezpiecznego śledzenia URL-i
+WATCHER_GURU_SENT_URLS = deque(maxlen=200)
+FIN_WATCH_SENT_URLS = deque(maxlen=200)
 
-# <<< POPRAWKA: Prawidłowe nazwy zmiennych >>>
-WATCHER_GURU_SENT_URLS = set()
-FIN_WATCH_SENT_URLS = set()
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
 # --------------------
 
-# <<< POPRAWKA: Inicjalizacja bota przeniesiona we właściwe miejsce >>>
+# --- Konfiguracja Gemini ---
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        gemini_model = genai.GenerativeModel(model_name='gemini-2.5-flash', safety_settings=safety_settings)
+    except Exception as e:
+        print(f"BŁĄD konfiguracji Gemini: {e}")
+        gemini_model = None
+else:
+    print("OSTRZEŻENIE: Brak GEMINI_API_KEY. Analiza AI będzie niedostępna.")
+    gemini_model = None
+
+# --- Inicjalizacja Bota ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- FUNKCJE POMOCNICZE (bez zmian) ---
+# --- FUNKCJE POMOCNICZE ---
+
 def get_fear_and_greed_image():
     timestamp = int(time.time())
     return f"https://alternative.me/crypto/fear-and-greed-index.png?v={timestamp}"
+
 def calculate_rsi(prices, period=14):
+    # Ulepszona funkcja RSI
+    if len(prices) < period + 1:
+        return 50.0 
+    
     deltas = np.diff(prices)
-    seed = deltas[:period+1]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down
+    gains = deltas[deltas > 0]
+    losses = -deltas[deltas < 0]
+    
+    avg_gain = np.mean(gains[:period]) if gains.size > 0 else 0
+    avg_loss = np.mean(losses[:period]) if losses.size > 0 else 0
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
+
     for i in range(period, len(deltas)):
         delta = deltas[i]
-        if delta > 0: upval, downval = delta, 0.0
-        else: upval, downval = 0.0, -delta
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down
+        gain = delta if delta > 0 else 0
+        loss = -delta if delta < 0 else 0
+        
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        
+        if avg_loss == 0:
+            rs = float('inf')
+        else:
+            rs = avg_gain / avg_loss
+        
         rsi = 100.0 - (100.0 / (1.0 + rs))
+        
     return rsi
+
 def get_top_gainers(count=10):
+    headers = {'x-cg-demo-api-key': COINGECKO_API_KEY.strip()}
+    stablecoin_symbols = set()
     try:
-        headers = {'x-cg-demo-api-key': COINGECKO_API_KEY.strip()}
+        # Pobież lista stablecoinów (pominięto, aby nie blokować wdrożenia)
+        stablecoin_symbols = {'usdt', 'usdc', 'dai', 'busd', 'ust', 'tusd'}
+    except Exception as e:
+        print(f"Ostrzeżenie: Nie udało się pobrać listy stablecoinów do filtrowania. {e}")
+
+    try:
         params = {'vs_currency': 'usd', 'order': 'market_cap_desc', 'per_page': 100, 'page': 1}
-        response = requests.get("https://api.coingecko.com/api/v3/coins/markets", params=params, headers=headers)
+        response = requests.get("https://api.coingecko.com/api/v3/coins/markets", params=params, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
-        sorted_gainers = sorted(data, key=lambda x: x.get('price_change_percentage_24h', 0), reverse=True)
+        filtered_data = [coin for coin in data if coin['symbol'] not in stablecoin_symbols]
+        sorted_gainers = sorted(filtered_data, key=lambda x: x.get('price_change_percentage_24h', 0) or 0, reverse=True)
         gainers_list = [f"🥇 **{c['name']} ({c['symbol'].upper()})**: `+{c.get('price_change_percentage_24h', 0):.2f}%`" for c in sorted_gainers[:count]]
-        return "\n".join(gainers_list) if gainers_list else "Brak danych."
-    except Exception as e: return f"Błąd: {e}"
+        return "\n".join(gainers_list) if gainers_list else "Brak danych lub wszystkie monety odnotowały spadek."
+    except requests.exceptions.RequestException as e:
+        print(f"Błąd połączenia z API CoinGecko: {e}")
+        return "Błąd: Problem z połączeniem z API CoinGecko."
+    except KeyError as e:
+        print(f"Błąd przetwarzania danych z CoinGecko (brak klucza): {e}")
+        return "Błąd: Niezgodna odpowiedź z API."
+
 def get_fed_events():
     try:
         url = f'https://www.alphavantage.co/query?function=ECONOMIC_CALENDAR&horizon=3month&apikey={ALPHAVANTAGE_API_KEY.strip()}'
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         csv_file = io.StringIO(response.text)
         reader = csv.DictReader(csv_file)
@@ -101,15 +149,18 @@ def get_fed_events():
                 event_name = row.get('event', '')
                 if any(k.lower() in event_name.lower() for k in keywords):
                     event_str = f"🗓️ **{event_date.strftime('%Y-%m-%d')}**: `{event_name}`"
-                    if event_str not in fed_events: fed_events.append(event_str)
+                    if event_str not in fed_events:
+                        fed_events.append(event_str)
         return "\n".join(fed_events) if fed_events else "Brak kluczowych wydarzeń FED w najbliższych 2 tygodniach."
-    except Exception as e: return f"Błąd: {e}"
+    except Exception as e:
+        return f"Błąd podczas pobierania wydarzeń FED: {e}"
+
 def get_btc_eth_analysis():
     analysis_text = ""
     for coin in ["bitcoin", "ethereum"]:
         try:
             headers = {'x-cg-demo-api-key': COINGECKO_API_KEY.strip()}
-            response_chart = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=15", headers=headers)
+            response_chart = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=15", headers=headers, timeout=10)
             response_chart.raise_for_status()
             prices = [p[1] for p in response_chart.json()['prices']]
             rsi = calculate_rsi(prices)
@@ -121,161 +172,281 @@ def get_btc_eth_analysis():
             resistance = max(prices_7_days)
             current_price = prices[-1]
             analysis_text += (f"**{coin.capitalize()} (${current_price:,.2f})**\n- **RSI (14D):** `{rsi:.2f}` ({rsi_interpretation})\n- **Wsparcie (7D):** `${support:,.2f}`\n- **Opór (7D):** `${resistance:,.2f}`\n\n")
-        except Exception:
+        except Exception as e:
+            print(f"Błąd analizy dla {coin}: {e}")
             analysis_text += f"Błąd analizy dla {coin.capitalize()}.\n"
     return analysis_text
 
-# --- GŁÓWNA PĘTLA ZDARZEŃ ---
+def get_realtime_market_snapshot():
+    snapshot = {"fear_greed": "Brak danych", "top_gainers": "Brak danych", "latest_headlines": []}
+    try:
+        response = requests.get("https://api.alternative.me/fng/?limit=1")
+        response.raise_for_status()
+        data = response.json()['data'][0]
+        snapshot['fear_greed'] = f"{data['value']} ({data['value_classification']})"
+    except Exception as e:
+        print(f"Błąd pobierania Fear & Greed: {e}")
+
+    snapshot['top_gainers'] = get_top_gainers(3)
+    try:
+        feed = feedparser.parse(WATCHER_GURU_RSS_URL)
+        snapshot['latest_headlines'] = [entry.title for entry in feed.entries[:5]]
+    except Exception as e:
+        print(f"Błąd pobierania nagłówków RSS: {e}")
+        snapshot['latest_headlines'] = ["Brak danych o newsach."]
+    return snapshot
+
+async def send_market_report(channel_or_ctx,
+                             title: str,
+                             color: discord.Color,
+                             include_fg: bool = False,
+                             include_gainers: bool = False,
+                             include_fed: bool = False,
+                             include_heatmap: bool = False,
+                             include_ai_analysis: bool = False):
+    
+    # Przetwarzanie odpowiedzi defer() dla Slash Commands
+    if isinstance(channel_or_ctx, discord.Interaction.followup) or isinstance(channel_or_ctx, discord.Interaction):
+        is_interaction = True
+        followup_send = channel_or_ctx.followup.send if isinstance(channel_or_ctx, discord.Interaction) else channel_or_ctx.send
+    else:
+        is_interaction = False
+        followup_send = channel_or_ctx.send
+
+    # Embed dla Fear & Greed, jeśli jest włączony, jest wysyłany jako pierwszy.
+    if include_fg:
+        fg_embed = discord.Embed(title=title, color=color)
+        fg_embed.add_field(name="Indeks Fear & Greed", value=" ", inline=False)
+        fg_embed.set_image(url=get_fear_and_greed_image())
+        await followup_send(embed=fg_embed)
+        main_embed = discord.Embed(color=color)
+    else:
+        main_embed = discord.Embed(title=title, color=color)
+
+    # Analiza AI
+    if include_ai_analysis and gemini_model:
+        ai_summary = await asyncio.to_thread(get_ai_report_analysis)
+        main_embed.add_field(name="🤖 Analiza i Prognoza AI", value=ai_summary, inline=False)
+    elif include_ai_analysis and not gemini_model:
+        main_embed.add_field(name="🤖 Analiza AI", value="Brak klucza API Gemini (GEMINI_API_KEY).", inline=False)
+
+
+    if include_gainers:
+        main_embed.add_field(name="🔥 Top 10 Gainers (24h)", value=get_top_gainers(10), inline=False)
+
+    if include_fed:
+        main_embed.add_field(name="🇺🇸 Wydarzenia FED (14 dni)", value=get_fed_events(), inline=False)
+
+    # Wyślij główny embed, jeśli zawiera jakieś pola
+    if main_embed.fields:
+        await followup_send(embed=main_embed)
+
+    # Mapa cieplna
+    if include_heatmap:
+        try:
+            timestamp = int(time.time())
+            # Użycie lepszego źródła mapy cieplnej, jeśli to konieczne
+            heatmap_url = f"https://quantifycrypto.com/heatmaps/crypto-heatmap.png?v={timestamp}" 
+            response = requests.get(heatmap_url)
+            response.raise_for_status()
+            image_file = discord.File(io.BytesIO(response.content), filename="heatmap.png")
+            heatmap_embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
+            heatmap_embed.set_image(url="attachment://heatmap.png")
+            await followup_send(embed=heatmap_embed, file=image_file)
+        except requests.exceptions.RequestException as e:
+            print(f"Błąd pobierania heatmapy w raporcie: {e}")
+            error_embed = discord.Embed(title="Błąd Mapy Cieplnej", description="Nie udało się załadować obrazu.", color=discord.Color.dark_red())
+            await followup_send(embed=error_embed)
+
+def get_ai_report_analysis():
+    if not gemini_model: return "Analiza AI wyłączona (brak klucza)."
+    print("Pobieranie danych do analizy AI dla raportu...")
+    market_data = get_realtime_market_snapshot()
+    headlines_str = "\n- ".join(market_data['latest_headlines'])
+
+    try:
+        prompt = (
+            f"Jesteś analitykiem rynku kryptowalut, tworzącym krótką analizę do automatycznego raportu na Discordzie. Na podstawie poniższych, aktualnych danych, stwórz zwięzłe podsumowanie (2-3 zdania) ostatnich kilku godzin i przedstaw krótkoterminową prognozę (1-2 zdania).\n\n"
+            f"--- AKTUALNE DANE ---\n"
+            f"1. Sentyment rynkowy (Fear & Greed Index): {market_data['fear_greed']}\n"
+            f"2. Najwięksi wygrani (Top Gainers): {market_data['top_gainers']}\n"
+            f"3. Ostatnie nagłówki wiadomości:\n- {headlines_str}\n"
+            f"--- KONIEC DANYCH ---\n\n"
+            f"Zadanie: Napisz krótką analizę. Skup się na ogólnym nastroju, zidentyfikuj kluczowe trendy i wskaż, czy rynek w najbliższych godzinach może być niestabilny, czy spodziewasz się kontynuacji trendu. Pisz po polsku, w profesjonalnym, ale przystępnym tonie."
+        )
+
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Błąd podczas generowania analizy AI do raportu: {e}")
+        return "Nie udało się wygenerować analizy z powodu błędu."
+
+
+# --- Komendy ukośnikowe ---
+
+@bot.tree.command(name="raport", description="Generuje pełny raport rynkowy na żądanie (F&G, Gainers, FED, Mapa Cieplna, Analiza AI).")
+async def slash_report(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True) # Defer, bo operacja potrwa długo
+    await send_market_report(interaction, title="Raport Rynkowy na Żądanie", color=discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_heatmap=True, include_ai_analysis=True)
+
+@bot.tree.command(name="fg", description="Wyświetla aktualny Indeks Fear & Greed.")
+async def slash_fg(interaction: discord.Interaction):
+    embed = discord.Embed(title="Fear & Greed Index", color=discord.Color.gold())
+    embed.set_image(url=get_fear_and_greed_image())
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="gainers", description="Pokazuje 10 kryptowalut z największym wzrostem w ciągu 24h.")
+async def slash_gainers(interaction: discord.Interaction):
+    description_text = get_top_gainers(10)
+    embed = discord.Embed(title="🔥 Top 10 Gainers (24h)", description=description_text, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="heatmap", description="Wyświetla mapę cieplną krypto.")
+async def slash_heatmap(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        timestamp = int(time.time())
+        heatmap_url = f"https://quantifycrypto.com/heatmaps/crypto-heatmap.png?v={timestamp}"
+        response = requests.get(heatmap_url)
+        response.raise_for_status()
+        image_file = discord.File(io.BytesIO(response.content), filename="heatmap.png")
+        embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
+        embed.set_image(url="attachment://heatmap.png")
+        await interaction.followup.send(embed=embed, file=image_file)
+    except requests.exceptions.RequestException as e:
+        print(f"Błąd pobierania heatmapy: {e}")
+        await interaction.followup.send("Wystąpił błąd podczas pobierania mapy cieplnej. Spróbuj ponownie.")
+
+@bot.tree.command(name="fed", description="Pokazuje nadchodzące kluczowe wydarzenia FED (14 dni).")
+async def slash_fed(interaction: discord.Interaction):
+    description_text = get_fed_events()
+    embed = discord.Embed(title="🇺🇸 Nadchodzące wydarzenia FED (14 dni)", description=description_text, color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="analiza", description="Wyświetla uproszczoną analizę techniczną dla BTC i ETH.")
+async def slash_analysis(interaction: discord.Interaction):
+    description_text = get_btc_eth_analysis()
+    embed = discord.Embed(title="Analiza BTC & ETH", description=description_text, color=discord.Color.orange())
+    await interaction.response.send_message(embed=embed)
+
+# --- Zdarzenia startowe i synchronizacja ---
+
 @bot.event
 async def on_ready():
     print(f'Zalogowano jako {bot.user}')
-    report_0600.start()
-    analysis_0800.start()
-    report_1200.start()
-    us_market_alert.start()
-    report_2000.start()
-    watcher_guru_forwarder.start()
-    fin_watch_forwarder.start()
+    try:
+        # Pamiętaj, aby wywołać start tasków tylko raz
+        report_0600.start()
+        report_1200.start()
+        report_2000.start()
+        watcher_guru_forwarder.start()
+        fin_watch_forwarder.start()
+        
+        # Opcjonalnie: Rozpocznij generowanie newsów AI po starcie
+        if gemini_model:
+            generate_gemini_news.start() 
 
-# --- KOMENDY NA ŻĄDANIE ---
-@bot.command(name='raport')
-async def command_report(ctx):
-    embed = discord.Embed(title=f"Raport Rynkowy na Żądanie", color=discord.Color.gold())
-    embed.add_field(name="Indeks Fear & Greed", value=" ", inline=False)
-    embed.set_image(url=get_fear_and_greed_image())
-    await ctx.send(embed=embed)
-    gainers_embed = discord.Embed(color=discord.Color.gold())
-    gainers_embed.add_field(name="🔥 Top 10 Gainers (24h)", value=get_top_gainers(10), inline=False)
-    gainers_embed.add_field(name="🇺🇸 Wydarzenia FED (14 dni)", value=get_fed_events(), inline=False)
-    await ctx.send(embed=gainers_embed)
-    heatmap_embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
-    heatmap_embed.set_image(url="https://finviz.com/crypto_charts.ashx?t=all&tf=d1&p=d&s=n")
-    await ctx.send(embed=heatmap_embed)
+        # Synchronizujemy komendy po starcie
+        synced = await bot.tree.sync()
+        print(f"Zsynchronizowano {len(synced)} komend(y) ukośnikowych.")
+    except Exception as e:
+        print(f"Błąd synchronizacji komend lub startu tasków: {e}")
 
-@bot.command(name='fg')
-async def command_fg(ctx):
-    embed = discord.Embed(title="Fear & Greed Index", color=discord.Color.gold())
-    embed.set_image(url=get_fear_and_greed_image())
-    await ctx.send(embed=embed)
 
-@bot.command(name='gainers')
-async def command_gainers(ctx):
-    embed = discord.Embed(title="🔥 Top 10 Gainers (24h)", description=get_top_gainers(10), color=discord.Color.green())
-    await ctx.send(embed=embed)
+# --- ZADANIA CYKLICZNE ---
 
-@bot.command(name='heatmap')
-async def command_heatmap(ctx):
-    embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
-    embed.set_image(url="https://finviz.com/crypto_charts.ashx?t=all&tf=d1&p=d&s=n")
-    await ctx.send(embed=embed)
-
-@bot.command(name='fed')
-async def command_fed(ctx):
-    embed = discord.Embed(title="🇺🇸 Nadchodzące wydarzenia FED (14 dni)", description=get_fed_events(), color=discord.Color.blue())
-    await ctx.send(embed=embed)
-
-@bot.command(name='analiza')
-async def command_analysis(ctx):
-    embed = discord.Embed(title="Analiza BTC & ETH", description=get_btc_eth_analysis(), color=discord.Color.orange())
-    await ctx.send(embed=embed)
-
-# --- STANDARDOWE ZAPLANOWANE ZADANIA ---
+# ZAKTUALIZOWANE RAPORTY Używają nowej, złożonej funkcji send_market_report
 @tasks.loop(time=datetime.time(hour=6, minute=0, tzinfo=TZ_POLAND))
 async def report_0600():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel: return
-    embed_fg = discord.Embed(title=f"Poranny Raport Rynkowy - {date.today().strftime('%d-%m-%Y')}", color=discord.Color.gold())
-    embed_fg.add_field(name="Indeks Fear & Greed", value=" ", inline=False)
-    embed_fg.set_image(url=get_fear_and_greed_image())
-    await channel.send(embed=embed_fg)
-    embed_data = discord.Embed(color=discord.Color.gold())
-    embed_data.add_field(name="🔥 Top 10 Gainers (24h)", value=get_top_gainers(10), inline=False)
-    embed_data.add_field(name="🇺🇸 Wydarzenia FED (14 dni)", value=get_fed_events(), inline=False)
-    await channel.send(embed=embed_data)
-    heatmap_embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
-    heatmap_embed.set_image(url="https://finviz.com/crypto_charts.ashx?t=all&tf=d1&p=d&s=n")
-    await channel.send(embed=heatmap_embed)
-
-@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=TZ_POLAND))
-async def analysis_0800():
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel: return
-    embed = discord.Embed(title="Analiza BTC & ETH", description=get_btc_eth_analysis(), color=discord.Color.orange())
-    await channel.send(embed=embed)
+    title = f"Poranny Raport Rynkowy - {date.today().strftime('%d-%m-%Y')}"
+    await send_market_report(channel, title, discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_heatmap=True, include_ai_analysis=True)
 
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=TZ_POLAND))
 async def report_1200():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel: return
-    embed = discord.Embed(title="Raport Południowy", color=discord.Color.green())
-    embed.add_field(name="🔥 Top 10 Gainers (24h)", value=get_top_gainers(10), inline=False)
-    await channel.send(embed=embed)
-    heatmap_embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
-    heatmap_embed.set_image(url="https://finviz.com/crypto_charts.ashx?t=all&tf=d1&p=d&s=n")
-    await channel.send(embed=heatmap_embed)
-
-@tasks.loop(time=datetime.time(hour=15, minute=25, tzinfo=TZ_POLAND))
-async def us_market_alert():
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel: return
-    await channel.send("🚨 **Alert: Giełda w USA otwiera się za 5 minut!** 🚨")
+    await send_market_report(channel, "Raport Południowy", discord.Color.green(), include_gainers=True, include_heatmap=True, include_ai_analysis=True)
 
 @tasks.loop(time=datetime.time(hour=20, minute=0, tzinfo=TZ_POLAND))
 async def report_2000():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel: return
-    embed = discord.Embed(title="Raport Wieczorny", color=discord.Color.purple())
-    embed.add_field(name="🔥 Top 10 Gainers (24h)", value=get_top_gainers(10), inline=False)
-    await channel.send(embed=embed)
-    heatmap_embed = discord.Embed(title="📊 Mapa Cieplna (Top 100)", color=discord.Color.red())
-    heatmap_embed.set_image(url="https://finviz.com/crypto_charts.ashx?t=all&tf=d1&p=d&s=n")
-    await channel.send(embed=heatmap_embed)
+    await send_market_report(channel, "Raport Wieczorny", discord.Color.purple(), include_gainers=True, include_heatmap=True, include_ai_analysis=True)
 
-# --- CIĄGŁE PRZEKAZYWANIE NEWSÓW ---
-async def process_and_send_news(channel, entry, source_name, sent_urls_set):
-    if entry.link in sent_urls_set: return
-    title = entry.title
-    summary_html = entry.summary if 'summary' in entry else ""
-    if summary_html:
-        soup = BeautifulSoup(summary_html, 'html.parser')
-        summary = soup.get_text(separator=' ', strip=True)
-    else: summary = ""
+@tasks.loop(hours=2)
+async def generate_gemini_news():
+    # Funkcja do generowania analizy co 2 godziny, jeśli jest aktywny klucz Gemini
+    if not gemini_model: return
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel: return
+    
+    print("Rozpoczynam generowanie szczegółowej analizy AI na podstawie świeżych danych...")
+    market_data = get_realtime_market_snapshot()
+    headlines_str = "\n- ".join(market_data['latest_headlines'])
+    current_date = datetime.datetime.now(TZ_POLAND).strftime("%Y-%m-%d %H:%M")
+    
     try:
-        title_pl = GoogleTranslator(source='auto', target='pl').translate(title)
-        summary_pl = GoogleTranslator(source='auto', target='pl').translate(summary) if summary else ""
+        # Prompt i generowanie
+        prompt = (f"Jesteś ekspertem i analitykiem rynku kryptowalut. Twoim zadaniem jest stworzenie podsumowania dla kanału na Discordzie na podstawie poniższych, aktualnych danych. Analizuj TYLKO dostarczone informacje.\n\n--- POCZĄTEK DANYCH (stan na {current_date}) ---\n1. Ogólny sentyment rynkowy (Fear & Greed Index): {market_data['fear_greed']}\n\n2. Kryptowaluty z największymi wzrostami (Top Gainers):\n{market_data['top_gainers']}\n\n3. Najnowsze nagłówki z wiadomości:\n- {headlines_str}\n--- KONIEC DANYCH ---\n\nZadanie: Na podstawie powyższych danych, stwórz listę **do 10 kluczowych punktów** opisujących sytuację na rynku. **Posortuj punkty w kolejności od najważniejszego (na górze) do najmniej ważnego (na dole).** Każdy punkt powinien być zwięzły i konkretny. Skup się na najważniejszych wnioskach dotyczących Bitcoina, Ethereum, sentymentu oraz trendów widocznych w newsach i wzrostach. Pisz po polsku.")
+        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        
+        embed = discord.Embed(title="📈 Szczegółowa Analiza Rynku (AI)", description=response.text, color=discord.Color.from_rgb(70, 130, 180))
+        embed.set_footer(text=f"Wygenerowano przez Gemini AI | Dane z {current_date}")
+        await channel.send(embed=embed)
+        print("Szczegółowa analiza AI oparta na świeżych danych wysłana pomyślnie.")
     except Exception as e:
-        print(f"Błąd tłumaczenia: {e}")
-        title_pl, summary_pl = title, summary
-    embed = discord.Embed(title=f"📰 {source_name}", description=f"**{title_pl}**", url=entry.link, color=discord.Color.dark_blue())
-    if summary_pl: embed.add_field(name="Podsumowanie", value=summary_pl[:1000] + "...", inline=False)
-    image_url = None
-    if 'media_content' in entry and entry.media_content: image_url = entry.media_content[0]['url']
-    elif 'enclosures' in entry and entry.enclosures:
-        for enc in entry.enclosures:
-            if 'image' in enc.get('type', ''): image_url = enc.href; break
-    elif 'links' in entry:
-        for link in entry.links:
-            if 'image' in link.get('type', ''): image_url = link.href; break
-    if image_url: embed.set_image(url=image_url)
-    await channel.send(embed=embed)
-    sent_urls_set.add(entry.link)
-    if len(sent_urls_set) > 200: sent_urls_set.pop()
+        print(f"Wystąpił błąd podczas generowania analizy przez Gemini: {e}")
 
 @tasks.loop(minutes=5)
 async def watcher_guru_forwarder():
     channel = bot.get_channel(WATCHER_GURU_CHANNEL_ID)
     if not channel: return
     feed = feedparser.parse(WATCHER_GURU_RSS_URL)
-    for entry in reversed(feed.entries[:10]):
+    for entry in reversed(feed.entries[:5]): 
         await process_and_send_news(channel, entry, "Watcher Guru", WATCHER_GURU_SENT_URLS)
+        await asyncio.sleep(1) # Czekanie na uniknięcie rate limitu
 
 @tasks.loop(minutes=5)
 async def fin_watch_forwarder():
     channel = bot.get_channel(FIN_WATCH_CHANNEL_ID)
     if not channel: return
     feed = feedparser.parse(FIN_WATCH_RSS_URL)
-    for entry in reversed(feed.entries[:10]):
+    for entry in reversed(feed.entries[:5]): 
         await process_and_send_news(channel, entry, "Fin Watch (Telegram)", FIN_WATCH_SENT_URLS)
+        await asyncio.sleep(1)
+
+async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
+    if entry.link in sent_urls_deque: return
+    
+    # Czyszczenie i tłumaczenie tytułu przez Gemini
+    tags_to_remove = ["@WatcherGuru", "@WatcherGur", "@WatcherGu", "@WatcherG", "@Watcher", "@Watche", "@Watch", "@Watc", "@FINNWatch", "@Fin_Watch", "@Finn", "@Fin"]
+    title_original = entry.title
+    for tag in tags_to_remove:
+        title_original = title_original.replace(tag, "")
+    title_original = title_original.strip()
+
+    try:
+        prompt = (f"Jesteś profesjonalnym tłumaczem dla kanału informacyjnego. Twoim zadaniem jest stworzenie jednego, zwięzłego i naturalnie brzmiącego tłumaczenia. Nie podawaj żadnych alternatyw, wariantów w nawiasach, uwag ani dodatkowych wyjaśnień. Podaj tylko ostateczną, najlepszą wersję.\n\nPrzetłumacz na polski: \"{title_original}\"")
+        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        title_pl = response.text.strip()
+    except Exception as e:
+        print(f"Błąd tłumaczenia Gemini: {e}")
+        title_pl = title_original
+
+    # Tworzenie embeda
+    embed = discord.Embed(title=f"📰 {source_name.replace('Watcher Guru', 'Wiadomości').replace('Fin Watch (Telegram)', 'Wiadomości Finansowe')}", description=f"**{title_pl}**", color=discord.Color.dark_blue())
+    
+    # Pobieranie obrazka
+    image_url = next((enc.href for enc in entry.get('enclosures', []) if 'image' in enc.get('type', '')), None)
+    if not image_url and 'media_content' in entry and entry.media_content:
+        image_url = next((media['url'] for media in entry.media_content if 'image' in media.get('type', '')), None)
+    if image_url:
+        embed.set_image(url=image_url)
+
+    await channel.send(embed=embed)
+    sent_urls_deque.append(entry.link)
 
 # Uruchomienie bota
 bot.run(BOT_TOKEN)
