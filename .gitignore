@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Klucze SSH i inne sekrety
+*.key
+*.pub
+.env

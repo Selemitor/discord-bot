@@ -1,0 +1,6 @@
+discord.py
+requests
+feedparser
+deep-translator
+numpy
+beautifulsoup4
