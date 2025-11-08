@@ -15,30 +15,11 @@ import numpy as np
 from bs4 import BeautifulSoup
 from collections import deque
 import asyncio
-from threading import Thread # <-- WAŻNE: Importujemy wątki
 from zoneinfo import ZoneInfo # <-- WAŻNE: Importujemy ZoneInfo
 
 # Wymaga instalacji: google-genai
 import google.generativeai as genai
 
-# --- Konfiguracja Flask (dla UptimeRobot) ---
-# Serwer Flask MUSI być zdefiniowany PRZED logiką bota.
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    """Endpoint dla UptimeRobot, aby utrzymać bota przy życiu."""
-    return "Bot jest aktywny!"
-
-@app.route('/healthz')
-def health_check():
-    """Endpoint dla Render Health Check."""
-    return "OK", 200
-
-def run_flask_server():
-    """Uruchamia serwer Flask na porcie podanym przez Render."""
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
 
 # --- Konfiguracja Bota Discord ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -445,11 +426,7 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
     sent_urls_deque.append(entry.link)
 
 
-# --- GŁÓWNE URUCHOMIENIE (Flask w wątku, Bot w głównym) ---
+# --- GŁÓWNE URUCHOMIENIE ---
 if __name__ == "__main__":
-    print("Uruchamianie serwera Flask w osobnym wątku...")
-    flask_thread = Thread(target=run_flask_server)
-    flask_thread.start()
-    
     print("Uruchamianie bota Discord...")
     bot.run(BOT_TOKEN)
