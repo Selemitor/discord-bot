@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    """Endpoint dla UptimeRobot, aby utrzymać bota przy życiu."""
+    """Endpoint dla UptimeRobot."""
     return "Bot jest aktywny (Serwer Web)!"
 
 @app.route('/healthz')
