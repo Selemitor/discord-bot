@@ -1,12 +1,10 @@
 discord.py
 requests
-python-dotenv # Chociaż używasz os.environ.get, warto to mieć na wszelki wypadek
+python-dotenv
 feedparser
 beautifulsoup4
 numpy
-python-csv # Jeśli potrzebne do obsługi CSV
 google-genai
-python-dateutil # Często jest wymaganym zależnością dla innych bibliotek czasowych
-python-decouple # Jeśli używasz tego, co może być wymagane przez niektóre zależności
-zoneinfo
+python-dateutil
 flask
+gunicorn
