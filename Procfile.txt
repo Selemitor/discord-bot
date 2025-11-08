@@ -1,1 +1,1 @@
-web: gunicorn web_server:app & python bot.py
+web: ./start.sh
