@@ -8,4 +8,5 @@ python-csv # Jeśli potrzebne do obsługi CSV
 google-genai
 python-dateutil # Często jest wymaganym zależnością dla innych bibliotek czasowych
 python-decouple # Jeśli używasz tego, co może być wymagane przez niektóre zależności
-zoneinfo # Jeśli jest używane bezpośrednio (chociaż w Pythonie 3.9+ to część standardowej biblioteki)
+zoneinfo
+flask

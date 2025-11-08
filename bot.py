@@ -5,6 +5,8 @@ import requests
 import datetime
 from datetime import date, timedelta
 import csv
+from flask import Flask
+from threading import Thread
 import io
 import feedparser
 import time
@@ -25,6 +27,25 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') # NOWY KLUCZ Z FLY.IO
 if not BOT_TOKEN:
     print("BlaD: Nie znaleziono BOT_TOKEN. Aplikacja nie wystartuje.")
     exit()
+
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    # Prosty endpoint, który odpowiada "Bot jest aktywny!"
+    return "Bot jest aktywny!"
+
+@app.route('/healthz')
+def health_check():
+    # Endpoint używany przez Render Health Check lub zewnętrznego pingera
+    return "OK", 200
+
+def run_flask_server():
+    # Render automatycznie udostępnia numer portu w zmiennej środowiskowej 'PORT'
+    port = int(os.environ.get('PORT', 5000))
+    # Uruchomienie serwera na porcie i adresie nasłuchującym na wszystkich interfejsach
+    app.run(host='0.0.0.0', port=port)
 
 # Upewnij się, ze te ID sa poprawne
 CHANNEL_ID = 1429744335389458452
