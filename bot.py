@@ -22,6 +22,7 @@ from flask import Flask # <-- WAŻNE: Importujemy Flask
 # Wymaga instalacji: google-genai
 from google import genai
 from google.genai import types
+
 # --- Konfiguracja Flask (dla UptimeRobot/Gunicorn) ---
 # Gunicorn będzie szukał obiektu 'app'
 app = Flask(__name__)
@@ -57,44 +58,57 @@ WATCHER_GURU_SENT_URLS = deque(maxlen=200)
 FIN_WATCH_SENT_URLS = deque(maxlen=200)
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
-# --- Konfiguracja Gemini ---
+# --- Konfiguracja Gemini (POPRAWIONA) ---
+gemini_client = None
+gemini_model_name = 'gemini-2.5-flash' # Domyślny model
+gemini_safety_settings = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+# Konfiguracja bezpieczeństwa dla generowania treści
+gemini_generation_config = types.GenerateContentConfig(safety_settings=gemini_safety_settings)
+
+
 if GEMINI_API_KEY:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
-        gemini_model = genai.GenerativeModel(model_name='gemini-2.5-flash', safety_settings=safety_settings)
+        # NOWA METODA: Tworzymy klienta. Klucz API jest pobierany automatycznie ze zmiennej środowiskowej.
+        gemini_client = genai.Client() 
         print("Konfiguracja Gemini OK.")
     except Exception as e:
         print(f"Błąd konfiguracji Gemini: {e}")
-        gemini_model = None
+        gemini_client = None
 else:
     print("OSTRZEŻENIE: Brak GEMINI_API_KEY. Analiza AI będzie niedostępna.")
-    gemini_model = None
 
 # --- Inicjalizacja Bota ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- Funkcja uruchamiająca Bota (w wątku) ---
-def run_discord_bot():
+# --- Funkcja uruchamiająca Bota (w wątku) (POPRAWIONA) ---
+def run_discord_bot_sync():
+    """Uruchamia bota w synchronicznej funkcji, zarządzając własną pętlą asyncio."""
     if not BOT_TOKEN:
         print("Bot nie może wystartować, brak BOT_TOKEN.")
         return
     print("Uruchamianie bota Discord w osobnym wątku...")
-    # Używamy try-except, aby bot nie zabił serwera Gunicorn w razie błędu
+    
+    # Tworzymy nową pętlę zdarzeń dla tego wątku, aby uniknąć błędu 'atexit'
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     try:
-        bot.run(BOT_TOKEN)
+        # Używamy bot.start() zamiast bot.run()
+        loop.run_until_complete(bot.start(BOT_TOKEN))
     except Exception as e:
         print(f"Krytyczny błąd podczas uruchamiania bota Discord: {e}")
+    finally:
+        loop.run_until_complete(bot.close())
+        loop.close()
 
 # --- FUNKCJE POMOCNICZE, KOMENDY, TASKI ---
-# (Wklej tutaj WSZYSTKIE swoje funkcje, komendy @bot.tree.command i taski @tasks.loop z bot.py )
 
 def get_fear_and_greed_image():
     timestamp = int(time.time())
@@ -135,6 +149,7 @@ def calculate_rsi(prices, period=14):
     return rsi
 
 def get_top_gainers(count=10):
+    if not COINGECKO_API_KEY: return "Brak klucza API CoinGecko."
     headers = {'x-cg-demo-api-key': COINGECKO_API_KEY.strip()}
     stablecoin_symbols = {'usdt', 'usdc', 'dai', 'busd', 'ust', 'tusd'}
 
@@ -152,6 +167,7 @@ def get_top_gainers(count=10):
         return "Blad: Problem z pobraniem danych."
 
 def get_fed_events():
+    if not ALPHAVANTAGE_API_KEY: return "Brak klucza API AlphaVantage."
     try:
         url = f'https://www.alphavantage.co/query?function=ECONOMIC_CALENDAR&horizon=3month&apikey={ALPHAVANTAGE_API_KEY.strip()}'
         response = requests.get(url, timeout=10)
@@ -177,6 +193,7 @@ def get_fed_events():
         return f"Blad podczas pobierania wydarzeń FED: {e}"
 
 def get_btc_eth_analysis():
+    if not COINGECKO_API_KEY: return "Brak klucza API CoinGecko."
     analysis_text = ""
     for coin in ["bitcoin", "ethereum"]:
         try:
@@ -240,10 +257,10 @@ async def send_market_report(channel_or_ctx,
     else:
         main_embed = discord.Embed(title=title, color=color)
 
-    if include_ai_analysis and gemini_model:
+    if include_ai_analysis and gemini_client:
         ai_summary = await asyncio.to_thread(get_ai_report_analysis)
         main_embed.add_field(name="🤖 Analiza i Prognoza AI", value=ai_summary, inline=False)
-    elif include_ai_analysis and not gemini_model:
+    elif include_ai_analysis and not gemini_client:
         main_embed.add_field(name="🤖 Analiza AI", value="Brak klucza API Gemini (GEMINI_API_KEY).", inline=False)
 
     if include_gainers:
@@ -269,8 +286,9 @@ async def send_market_report(channel_or_ctx,
             print(f"Blad pobierania heatmapy w raporcie: {e}")
             await followup_send("Wystapil blad podczas pobierania mapy cieplnej.", ephemeral=True)
 
+# --- POPRAWKA WYWOŁANIA GEMINI ---
 def get_ai_report_analysis():
-    if not gemini_model: return "Analiza AI wylaczona (brak klucza)."
+    if not gemini_client: return "Analiza AI wylaczona (brak klucza)."
     print("Pobieranie danych do analizy AI dla raportu...")
     market_data = get_realtime_market_snapshot()
     headlines_str = "\n- ".join(market_data['latest_headlines'])
@@ -286,7 +304,12 @@ def get_ai_report_analysis():
             f"Zadanie: Napisz krotka analizę. Skup się na ogolnym nastroju, zidentyfikuj kluczowe trendy i wskaz, czy rynek w najblizszych godzinach moze byc niestabilny, czy spodziewasz się kontynuacji trendu. Pisz po polsku, w profesjonalnym, ale przystępnym tonie."
         )
 
-        response = gemini_model.generate_content(prompt)
+        # NOWA METODA: Używamy klienta i podajemy model oraz konfigurację
+        response = gemini_client.models.generate_content(
+            model=gemini_model_name,
+            contents=prompt,
+            config=gemini_generation_config
+        )
         return response.text.strip()
     except Exception as e:
         print(f"Blad podczas generowania analizy AI do raportu: {e}")
@@ -354,7 +377,7 @@ async def on_ready():
         if not watcher_guru_forwarder.is_running(): watcher_guru_forwarder.start()
         if not fin_watch_forwarder.is_running(): fin_watch_forwarder.start()
         
-        if gemini_model and not generate_gemini_news.is_running():
+        if gemini_client and not generate_gemini_news.is_running():
             generate_gemini_news.start() 
 
         synced = await bot.tree.sync()
@@ -384,9 +407,10 @@ async def report_2000():
     if not channel: return
     await send_market_report(channel, "Raport Wieczorny", discord.Color.purple(), include_gainers=True, include_heatmap=True, include_ai_analysis=True)
 
+# --- POPRAWKA WYWOŁANIA GEMINI ---
 @tasks.loop(hours=2)
 async def generate_gemini_news():
-    if not gemini_model: return
+    if not gemini_client: return
     channel = bot.get_channel(CHANNEL_ID)
     if not channel: return
     
@@ -397,7 +421,14 @@ async def generate_gemini_news():
     
     try:
         prompt = (f"Jestes ekspertem i analitykiem rynku kryptowalut. Twoim zadaniem jest stworzenie podsumowania dla kanalu na Discordzie na podstawie ponizszych, aktualnych danych. Analizuj TYLKO dostarczone informacje.\n\n--- POCZĄTEK DANYCH (stan na {current_date}) ---\n1. Ogolny sentyment rynkowy (Fear & Greed Index): {market_data['fear_greed']}\n\n2. Kryptowaluty z największymi wzrostami (Top Gainers):\n{market_data['top_gainers']}\n\n3. Najnowsze naglowki z wiadomosci:\n- {headlines_str}\n--- KONIEC DANYCH ---\n\nZadanie: Na podstawie powyzszych danych, stworz listę **do 10 kluczowych punktow** opisujacych situację na rynku. **Posortuj punkty w kolejnosci od najwazniejszego (na gorze) do najmniej waznego (na dole).** Kazdy punkt powinien byc zwięzly i konkretny. Skup się na najwazniejszych wnioskach dotyczacych Bitcoina, Ethereum, sentymentu oraz trendow widocznych w newsach i wzrostach. Pisz po polsku.")
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        
+        # NOWA METODA
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=gemini_model_name,
+            contents=prompt,
+            config=gemini_generation_config
+        )
         
         embed = discord.Embed(title="📈 Szczegolowa Analiza Rynku (AI)", description=response.text, color=discord.Color.from_rgb(70, 130, 180))
         embed.set_footer(text=f"Wygenerowano przez Gemini AI | Dane z {current_date}")
@@ -423,6 +454,7 @@ async def fin_watch_forwarder():
         await process_and_send_news(channel, entry, "Fin Watch (Telegram)", FIN_WATCH_SENT_URLS)
         await asyncio.sleep(1)
 
+# --- POPRAWKA WYWOŁANIA GEMINI ---
 async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
     if entry.link in sent_urls_deque: return
     
@@ -432,14 +464,24 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
         title_original = title_original.replace(tag, "")
     title_original = title_original.strip()
 
-    try:
-        prompt = (f"Jestes profesjonalnym tlumaczem dla kanalu informacyjnego. Twoim zadaniem jest stworzenie jednego, zwięzlego i naturalnie brzmiacego tlumaczenia. Nie podawaj zadnych alternatyw, wariantow w nawiasach, uwag ani dodatkowych wyjasnień. Podaj tylko ostateczna, najlepsza wersję.\n\nPrzetlumacz na polski: \"{title_original}\"")
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
-        title_pl = response.text.strip()
-    except Exception as e:
-        print(f"Blad tlumaczenia Gemini: {e}")
-        title_pl = title_original
-
+    title_pl = title_original # Domyślnie, jeśli AI zawiedzie
+    if gemini_client: # Tłumaczymy tylko jeśli AI jest dostępne
+        try:
+            prompt = (f"Jestes profesjonalnym tlumaczem dla kanalu informacyjnego. Twoim zadaniem jest stworzenie jednego, zwięzlego i naturalnie brzmiacego tlumaczenia. Nie podawaj zadnych alternatyw, wariantow w nawiasach, uwag ani dodatkowych wyjasnień. Podaj tylko ostateczna, najlepsza wersję.\n\nPrzetlumacz na polski: \"{title_original}\"")
+            
+            # NOWA METODA
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model=gemini_model_name,
+                contents=prompt,
+                config=gemini_generation_config
+            )
+            title_pl = response.text.strip()
+        except Exception as e:
+            print(f"Blad tlumaczenia Gemini: {e}")
+            # W razie błędu, używamy oryginalnego tytułu
+            title_pl = title_original
+    
     embed = discord.Embed(title=f"📰 {source_name.replace('Watcher Guru', 'Wiadomosci').replace('Fin Watch (Telegram)', 'Wiadomosci Finansowe')}", description=f"**{title_pl}**", color=discord.Color.dark_blue())
     
     image_url = next((enc.href for enc in entry.get('enclosures', []) if 'image' in enc.get('type', '')), None)
@@ -457,7 +499,7 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
 # My wykorzystujemy ten fakt, aby uruchomić bota w osobnym wątku.
 
 print("Inicjalizacja wątku bota Discord...")
-bot_thread = Thread(target=run_discord_bot)
+bot_thread = Thread(target=run_discord_bot_sync)
 bot_thread.start()
 
 # Blok 'if __name__ == "__main__":' nie jest już potrzebny, 
