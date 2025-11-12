@@ -51,7 +51,7 @@ else:
 # --- Reszta Konfiguracji ---
 CHANNEL_ID = 1429744335389458452
 WATCHER_GURU_CHANNEL_ID = 1429719129702535248 
-FIN_WATCH_CHANNEL_ID = 1429719129702535248
+# FIN_WATCH_CHANNEL_ID został usunięty, ponieważ nie jest już używany
 WATCHER_GURU_RSS_URL = "https://watcher.guru/feed"
 
 WATCHER_GURU_SENT_URLS = deque(maxlen=200)
@@ -72,10 +72,6 @@ gemini_generation_config = types.GenerateContentConfig(safety_settings=gemini_sa
 
 
 # --- POCZĄTEK BLOKU: INTERAKTYWNY KALKULATOR MM ---
-
-# Upewnij się, że masz ten import na górze pliku, jeśli go brakuje:
-# import discord
-# from discord.ext import commands
 
 class KalkulatorMMModal(discord.ui.Modal, title="Kalkulator Wielkości Pozycji"):
     """
@@ -491,6 +487,19 @@ async def slash_kalkulator(interaction: discord.Interaction):
     # Ta komenda po prostu tworzy instancję naszego Modala i go wysyła
     await interaction.response.send_modal(KalkulatorMMModal())
 
+# --- NOWA KOMENDA (ZMIANA 3) ---
+@bot.tree.command(name="analiza_ai", description="Generuje szczegółową analizę rynkową AI na żądanie.")
+async def slash_analiza_ai(interaction: discord.Interaction):
+    # Dajemy znać Discordowi, że "myślimy", bo Gemini potrzebuje czasu
+    await interaction.response.defer(thinking=True)
+    
+    # Wywołujemy naszą nową funkcję, aby pobrała embed
+    analysis_embed = await get_detailed_ai_analysis_embed()
+    
+    # Wysyłamy wynik jako followup
+    await interaction.followup.send(embed=analysis_embed)
+
+
 # --- Zdarzenia startowe i synchronizacja ---
 
 @bot.event
@@ -502,7 +511,8 @@ async def on_ready():
         if not report_1200.is_running(): report_1200.start()
         if not report_2000.is_running(): report_2000.start()
         if not watcher_guru_forwarder.is_running(): watcher_guru_forwarder.start()
-        if not fin_watch_forwarder.is_running(): fin_watch_forwarder.start()
+        
+        # --- POPRAWKA: Usunięto wywołanie fin_watch_forwarder, ponieważ pętla nie istnieje ---
         
         if gemini_client and not generate_gemini_news.is_running():
             generate_gemini_news.start() 
@@ -534,22 +544,25 @@ async def report_2000():
     if not channel: return
     await send_market_report(channel, "Raport Wieczorny", discord.Color.purple(), include_gainers=True, include_heatmap=True, include_ai_analysis=True)
 
-# --- POPRAWKA WYWOŁANIA GEMINI ---
-@tasks.loop(hours=2)
-async def generate_gemini_news():
-    if not gemini_client: return
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel: return
-    
-    print("Rozpoczynam generowanie szczegolowej analizy AI...")
+
+# --- NOWA FUNKCJA GŁÓWNA (ZMIANA 1) ---
+async def get_detailed_ai_analysis_embed():
+    """
+    Pobiera dane rynkowe, generuje szczegółową analizę AI przez Gemini
+    i zwraca gotowy obiekt discord.Embed.
+    """
+    if not gemini_client:
+        embed = discord.Embed(title="📈 Szczegółowa Analiza Rynku (AI)", description="Analiza AI jest wyłączona (brak klucza API Gemini).", color=discord.Color.red())
+        return embed
+
+    print("Rozpoczynam generowanie szczegolowej analizy AI (na żądanie lub z pętli)...")
     market_data = get_realtime_market_snapshot()
     headlines_str = "\n- ".join(market_data['latest_headlines'])
     current_date = datetime.datetime.now(TZ_POLAND).strftime("%Y-%m-%d %H:%M")
-    
+
     try:
         prompt = (f"Jestes ekspertem i analitykiem rynku kryptowalut. Twoim zadaniem jest stworzenie podsumowania dla kanalu na Discordzie na podstawie ponizszych, aktualnych danych. Analizuj TYLKO dostarczone informacje.\n\n--- POCZĄTEK DANYCH (stan na {current_date}) ---\n1. Ogolny sentyment rynkowy (Fear & Greed Index): {market_data['fear_greed']}\n\n2. Kryptowaluty z największymi wzrostami (Top Gainers):\n{market_data['top_gainers']}\n\n3. Najnowsze naglowki z wiadomosci:\n- {headlines_str}\n--- KONIEC DANYCH ---\n\nZadanie: Na podstawie powyzszych danych, stworz listę **do 10 kluczowych punktow** opisujacych situację na rynku. **Posortuj punkty w kolejnosci od najwazniejszego (na gorze) do najmniej waznego (na dole).** Kazdy punkt powinien byc zwięzly i konkretny. Skup się na najwazniejszych wnioskach dotyczacych Bitcoina, Ethereum, sentymentu oraz trendow widocznych w newsach i wzrostach. Pisz po polsku.")
         
-        # NOWA METODA
         response = await asyncio.to_thread(
             gemini_client.models.generate_content,
             model=gemini_model_name,
@@ -557,11 +570,31 @@ async def generate_gemini_news():
             config=gemini_generation_config
         )
         
-        embed = discord.Embed(title="📈 Szczegolowa Analiza Rynku (AI)", description=response.text, color=discord.Color.from_rgb(70, 130, 180))
+        embed = discord.Embed(title="📈 Szczegółowa Analiza Rynku (AI)", description=response.text, color=discord.Color.from_rgb(70, 130, 180))
         embed.set_footer(text=f"Wygenerowano przez Gemini AI | Dane z {current_date}")
-        await channel.send(embed=embed)
+        return embed
+        
     except Exception as e:
         print(f"Wystapil blad podczas generowania analizy przez Gemini: {e}")
+        error_message = f"Wystąpił błąd podczas generowania analizy.\n`{e}`"
+        # Sprawdź, czy to błąd przeciążenia
+        if "503 UNAVAILABLE" in str(e) or "overloaded" in str(e):
+            error_message = "Nie udało się wygenerować analizy. Model AI jest obecnie przeciążony. Spróbuj ponownie za chwilę."
+            
+        embed = discord.Embed(title="📈 Szczegółowa Analiza Rynku (AI)", description=error_message, color=discord.Color.red())
+        return embed
+
+
+# --- ZAKTUALIZOWANA PĘTLA (ZMIANA 2) ---
+@tasks.loop(hours=2)
+async def generate_gemini_news():
+    if not gemini_client: return
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel: return
+    
+    # Wywołujemy nową funkcję i wysyłamy wynik
+    analysis_embed = await get_detailed_ai_analysis_embed()
+    await channel.send(embed=analysis_embed)
 
 @tasks.loop(minutes=5)
 async def watcher_guru_forwarder():
@@ -588,7 +621,7 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
     title_original = title_original.strip()
 
     title_pl = title_original # Domyślnie, jeśli AI zawiedzie
-    if gemini_client: # Tłumaczymy tylko jeśli AI jest dostępne
+    if gemini_client: # Tłumaczymy only jeśli AI jest dostępne
         try:
             prompt = (f"Jestes profesjonalnym tlumaczem dla kanalu informacyjnego. Twoim zadaniem jest stworzenie jednego, zwięzlego i naturalnie brzmiacego tlumaczenia. Nie podawaj zadnych alternatyw, wariantow w nawiasach, uwag ani dodatkowych wyjasnień. Podaj tylko ostateczna, najlepsza wersję.\n\nPrzetlumacz na polski: \"{title_original}\"")
             
