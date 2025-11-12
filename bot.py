@@ -60,7 +60,7 @@ TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
 # --- Konfiguracja Gemini (POPRAWIONA) ---
 gemini_client = None
-gemini_model_name = 'gemini-2.5-flash' # Domyślny model
+gemini_model_name = 'gemini-2.5-pro' # Domyślny model
 gemini_safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
