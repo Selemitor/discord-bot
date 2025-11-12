@@ -574,6 +574,10 @@ async def watcher_guru_forwarder():
 
 
 # --- POPRAWKA WYWOŁANIA GEMINI ---
+# --- PODMIEŃ CAŁĄ TĘ FUNKCJĘ ---
+
+# (Upewnij się, że na górze pliku masz import: from bs4 import BeautifulSoup)
+
 async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
     if entry.link in sent_urls_deque: return
     
@@ -601,13 +605,43 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
             # W razie błędu, używamy oryginalnego tytułu
             title_pl = title_original
     
+    # --- NOWA, ZAKTUALIZOWANA LOGIKA WYSZUKIWANIA OBRAZKA ---
+    image_url = None
+
+    # Metoda 1: Sprawdź 'media_content' (często w Atom)
+    if 'media_content' in entry and entry.media_content:
+        image_url = next((media['url'] for media in entry.media_content if 'image' in media.get('type', '')), None)
+
+    # Metoda 2: Sprawdź 'enclosures' (standard RSS, tak jak było)
+    if not image_url and 'enclosures' in entry:
+        image_url = next((enc.href for enc in entry.enclosures if 'image' in enc.get('type', '')), None)
+
+    # Metoda 3: Sprawdź 'media:thumbnail' (popularny tag w RSS)
+    if not image_url and 'media_thumbnail' in entry:
+        image_url = entry.media_thumbnail[0].get('url')
+
+    # Metoda 4: Przeszukaj treść (summary/content) w poszukiwaniu tagu <img>
+    # (Twój skrypt już importuje BeautifulSoup, więc to zadziała)
+    if not image_url:
+        content_html = entry.get('summary', '') or entry.get('content', [{}])[0].get('value', '')
+        if content_html:
+            try:
+                soup = BeautifulSoup(content_html, 'html.parser')
+                img_tag = soup.find('img') # Znajdź pierwszy tag <img>
+                if img_tag and img_tag.has_attr('src'):
+                    image_url = img_tag['src']
+            except Exception as e:
+                print(f"Błąd parsowania HTML (BeautifulSoup): {e}")
+    # --- KONIEC NOWEJ LOGIKI ---
+    
     embed = discord.Embed(title=f"📰 {source_name.replace('Watcher Guru', 'Wiadomosci').replace('Fin Watch (Telegram)', 'Wiadomosci Finansowe')}", description=f"**{title_pl}**", color=discord.Color.dark_blue())
     
-    image_url = next((enc.href for enc in entry.get('enclosures', []) if 'image' in enc.get('type', '')), None)
-    if not image_url and 'media_content' in entry and entry.media_content:
-        image_url = next((media['url'] for media in entry.media_content if 'image' in media.get('type', '')), None)
+    # Ta część pozostaje bez zmian, ale teraz image_url ma większą szansę istnieć
     if image_url:
         embed.set_image(url=image_url)
+    else:
+        # Ten log pomoże Ci sprawdzić, czy obrazki faktycznie są znajdowane
+        print(f"[DEBUG] Nie znaleziono obrazka dla: {title_original}")
 
     await channel.send(embed=embed)
     sent_urls_deque.append(entry.link)
