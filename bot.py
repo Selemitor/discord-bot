@@ -1,5 +1,5 @@
 # Plik: bot.py
-# TO JEST POPRAWNA WERSJA ŁĄCZĄCA FLASK I DISCORDA W JEDNYM PROCESIE
+# OSTATECZNA WERSJA: Łączy Flask (dla Render) i Bota Discord w jednym procesie.
 
 import os
 import discord
@@ -15,11 +15,32 @@ import numpy as np
 from bs4 import BeautifulSoup
 from collections import deque
 import asyncio
-from zoneinfo import ZoneInfo # <-- WAŻNE: Importujemy ZoneInfo
+from zoneinfo import ZoneInfo
+from threading import Thread # <-- WAŻNE: Importujemy wątki
+from flask import Flask # <-- WAŻNE: Importujemy Flask
 
 # Wymaga instalacji: google-genai
 import google.generativeai as genai
 
+# --- Konfiguracja Flask (dla UptimeRobot) ---
+# Serwer Flask MUSI być zdefiniowany PRZED logiką bota.
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """Endpoint dla UptimeRobot, aby utrzymać bota przy życiu."""
+    return "Bot jest aktywny!"
+
+@app.route('/healthz')
+def health_check():
+    """Endpoint dla Render Health Check."""
+    return "OK", 200
+
+def run_flask_server():
+    """Uruchamia serwer Flask na porcie podanym przez Render."""
+    # Render automatycznie ustawi zmienną PORT
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
 # --- Konfiguracja Bota Discord ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -67,7 +88,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- FUNKCJE POMOCNICZE (Wklej tutaj WSZYSTKIE swoje funkcje: get_fear_and_greed_image, calculate_rsi, itd.) ---
+# --- FUNKCJE POMOCNICZE ---
 
 def get_fear_and_greed_image():
     timestamp = int(time.time())
@@ -149,7 +170,6 @@ def get_fed_events():
     except Exception as e:
         return f"Blad podczas pobierania wydarzeń FED: {e}"
 
-# ... (Wklej tutaj resztę swoich funkcji: get_btc_eth_analysis, get_realtime_market_snapshot, send_market_report, get_ai_report_analysis) ...
 def get_btc_eth_analysis():
     analysis_text = ""
     for coin in ["bitcoin", "ethereum"]:
@@ -267,7 +287,7 @@ def get_ai_report_analysis():
         return "Nie udalo się wygenerowac analizy z powodu blędu."
 
 
-# --- Komendy ukosnikowe (Wklej tutaj WSZYSTKIE swoje komendy @bot.tree.command) ---
+# --- Komendy ukosnikowe ---
 
 @bot.tree.command(name="raport", description="Generuje pelny raport rynkowy na zadanie.")
 async def slash_report(interaction: discord.Interaction):
@@ -337,7 +357,7 @@ async def on_ready():
         print(f"Blad synchronizacji komend lub startu taskow: {e}")
 
 
-# --- ZADANIA CYKLICZNE (Wklej tutaj WSZYSTKIE swoje @tasks.loop) ---
+# --- ZADANIA CYKLICZNE ---
 
 @tasks.loop(time=datetime.time(hour=6, minute=0, tzinfo=TZ_POLAND))
 async def report_0600():
@@ -426,7 +446,11 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
     sent_urls_deque.append(entry.link)
 
 
-# --- GŁÓWNE URUCHOMIENIE ---
+# --- GŁÓWNE URUCHOMIENIE (Flask w wątku, Bot w głównym) ---
 if __name__ == "__main__":
+    print("Uruchamianie serwera Flask w osobnym wątku...")
+    flask_thread = Thread(target=run_flask_server)
+    flask_thread.start()
+    
     print("Uruchamianie bota Discord...")
     bot.run(BOT_TOKEN)
