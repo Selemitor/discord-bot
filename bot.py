@@ -21,7 +21,7 @@ from flask import Flask # <-- WAŻNE: Importujemy Flask
 
 # Wymaga instalacji: google-genai
 from google import genai
-
+from google.genai import types
 # --- Konfiguracja Flask (dla UptimeRobot/Gunicorn) ---
 # Gunicorn będzie szukał obiektu 'app'
 app = Flask(__name__)
