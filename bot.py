@@ -1,5 +1,5 @@
 # Plik: bot.py
-# OSTATECZNA WERSJA: Łączy Flask (dla Render) i Bota Discord w jednym procesie.
+# OSTATECZNA WERSJA: Łączy Flask (dla Gunicorn) i Bota Discord (w wątku).
 
 import os
 import discord
@@ -20,10 +20,10 @@ from threading import Thread # <-- WAŻNE: Importujemy wątki
 from flask import Flask # <-- WAŻNE: Importujemy Flask
 
 # Wymaga instalacji: google-genai
-import google.generativeai as genai
+from google import genai
 
-# --- Konfiguracja Flask (dla UptimeRobot) ---
-# Serwer Flask MUSI być zdefiniowany PRZED logiką bota.
+# --- Konfiguracja Flask (dla UptimeRobot/Gunicorn) ---
+# Gunicorn będzie szukał obiektu 'app'
 app = Flask(__name__)
 
 @app.route('/')
@@ -36,12 +36,6 @@ def health_check():
     """Endpoint dla Render Health Check."""
     return "OK", 200
 
-def run_flask_server():
-    """Uruchamia serwer Flask na porcie podanym przez Render."""
-    # Render automatycznie ustawi zmienną PORT
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
-
 # --- Konfiguracja Bota Discord ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY')
@@ -50,19 +44,17 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 if not BOT_TOKEN:
     print("KRYTYCZNY BŁĄD: Nie znaleziono BOT_TOKEN. Aplikacja nie wystartuje.")
-    exit()
+else:
+    print("BOT_TOKEN znaleziony.")
 
-# Upewnij się, ze te ID sa poprawne
+# --- Reszta Konfiguracji ---
 CHANNEL_ID = 1429744335389458452
 WATCHER_GURU_CHANNEL_ID = 1429719129702535248 
 FIN_WATCH_CHANNEL_ID = 1429719129702535248
-
 WATCHER_GURU_RSS_URL = "https://rss.app/feeds/bP1lIE9lQ9hTBuSk.xml"
 FIN_WATCH_RSS_URL = "https://rss.app/feeds/R0DJZuoPNWe5yCMY.xml"
-
 WATCHER_GURU_SENT_URLS = deque(maxlen=200)
 FIN_WATCH_SENT_URLS = deque(maxlen=200)
-
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
 # --- Konfiguracja Gemini ---
@@ -76,6 +68,7 @@ if GEMINI_API_KEY:
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
         gemini_model = genai.GenerativeModel(model_name='gemini-2.5-flash', safety_settings=safety_settings)
+        print("Konfiguracja Gemini OK.")
     except Exception as e:
         print(f"Błąd konfiguracji Gemini: {e}")
         gemini_model = None
@@ -88,7 +81,20 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- FUNKCJE POMOCNICZE ---
+# --- Funkcja uruchamiająca Bota (w wątku) ---
+def run_discord_bot():
+    if not BOT_TOKEN:
+        print("Bot nie może wystartować, brak BOT_TOKEN.")
+        return
+    print("Uruchamianie bota Discord w osobnym wątku...")
+    # Używamy try-except, aby bot nie zabił serwera Gunicorn w razie błędu
+    try:
+        bot.run(BOT_TOKEN)
+    except Exception as e:
+        print(f"Krytyczny błąd podczas uruchamiania bota Discord: {e}")
+
+# --- FUNKCJE POMOCNICZE, KOMENDY, TASKI ---
+# (Wklej tutaj WSZYSTKIE swoje funkcje, komendy @bot.tree.command i taski @tasks.loop z bot.py )
 
 def get_fear_and_greed_image():
     timestamp = int(time.time())
@@ -341,14 +347,14 @@ async def slash_analysis(interaction: discord.Interaction):
 async def on_ready():
     print(f'Zalogowano jako {bot.user}')
     try:
-        # Pamiętaj, aby wywolac start taskow tylko raz
-        report_0600.start()
-        report_1200.start()
-        report_2000.start()
-        watcher_guru_forwarder.start()
-        fin_watch_forwarder.start()
+        # Sprawdzanie, czy taski już działają, aby uniknąć restartu
+        if not report_0600.is_running(): report_0600.start()
+        if not report_1200.is_running(): report_1200.start()
+        if not report_2000.is_running(): report_2000.start()
+        if not watcher_guru_forwarder.is_running(): watcher_guru_forwarder.start()
+        if not fin_watch_forwarder.is_running(): fin_watch_forwarder.start()
         
-        if gemini_model:
+        if gemini_model and not generate_gemini_news.is_running():
             generate_gemini_news.start() 
 
         synced = await bot.tree.sync()
@@ -357,7 +363,7 @@ async def on_ready():
         print(f"Blad synchronizacji komend lub startu taskow: {e}")
 
 
-# --- ZADANIA CYKLICZNE ---
+# --- ZADANIA CYKLICZNE (tasks.loop) ---
 
 @tasks.loop(time=datetime.time(hour=6, minute=0, tzinfo=TZ_POLAND))
 async def report_0600():
@@ -390,7 +396,7 @@ async def generate_gemini_news():
     current_date = datetime.datetime.now(TZ_POLAND).strftime("%Y-%m-%d %H:%M")
     
     try:
-        prompt = (f"Jestes ekspertem i analitykiem rynku kryptowalut. Twoim zadaniem jest stworzenie podsumowania dla kanalu na Discordzie na podstawie ponizszych, aktualnych danych. Analizuj TYLKO dostarczone informacje.\n\n--- POCZĄTEK DANYCH (stan na {current_date}) ---\n1. Ogolny sentyment rynkowy (Fear & Greed Index): {market_data['fear_greed']}\n\n2. Kryptowaluty z największymi wzrostami (Top Gainers):\n{market_data['top_gainers']}\n\n3. Najnowsze naglowki z wiadomosci:\n- {headlines_str}\n--- KONIEC DANYCH ---\n\nZadanie: Na podstawie powyzszych danych, stworz listę **do 10 kluczowych punktow** opisujacych sytuację na rynku. **Posortuj punkty w kolejnosci od najwazniejszego (na gorze) do najmniej waznego (na dole).** Kazdy punkt powinien byc zwięzly i konkretny. Skup się na najwazniejszych wnioskach dotyczacych Bitcoina, Ethereum, sentymentu oraz trendow widocznych w newsach i wzrostach. Pisz po polsku.")
+        prompt = (f"Jestes ekspertem i analitykiem rynku kryptowalut. Twoim zadaniem jest stworzenie podsumowania dla kanalu na Discordzie na podstawie ponizszych, aktualnych danych. Analizuj TYLKO dostarczone informacje.\n\n--- POCZĄTEK DANYCH (stan na {current_date}) ---\n1. Ogolny sentyment rynkowy (Fear & Greed Index): {market_data['fear_greed']}\n\n2. Kryptowaluty z największymi wzrostami (Top Gainers):\n{market_data['top_gainers']}\n\n3. Najnowsze naglowki z wiadomosci:\n- {headlines_str}\n--- KONIEC DANYCH ---\n\nZadanie: Na podstawie powyzszych danych, stworz listę **do 10 kluczowych punktow** opisujacych situację na rynku. **Posortuj punkty w kolejnosci od najwazniejszego (na gorze) do najmniej waznego (na dole).** Kazdy punkt powinien byc zwięzly i konkretny. Skup się na najwazniejszych wnioskach dotyczacych Bitcoina, Ethereum, sentymentu oraz trendow widocznych w newsach i wzrostach. Pisz po polsku.")
         response = await asyncio.to_thread(gemini_model.generate_content, prompt)
         
         embed = discord.Embed(title="📈 Szczegolowa Analiza Rynku (AI)", description=response.text, color=discord.Color.from_rgb(70, 130, 180))
@@ -446,11 +452,13 @@ async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
     sent_urls_deque.append(entry.link)
 
 
-# --- GŁÓWNE URUCHOMIENIE (Flask w wątku, Bot w głównym) ---
-if __name__ == "__main__":
-    print("Uruchamianie serwera Flask w osobnym wątku...")
-    flask_thread = Thread(target=run_flask_server)
-    flask_thread.start()
-    
-    print("Uruchamianie bota Discord...")
-    bot.run(BOT_TOKEN)
+# --- GŁÓWNE URUCHOMIENIE (Flask przez Gunicorn, Bot w wątku) ---
+# Gunicorn uruchomi ten plik i będzie szukał obiektu 'app'.
+# My wykorzystujemy ten fakt, aby uruchomić bota w osobnym wątku.
+
+print("Inicjalizacja wątku bota Discord...")
+bot_thread = Thread(target=run_discord_bot)
+bot_thread.start()
+
+# Blok 'if __name__ == "__main__":' nie jest już potrzebny, 
+# ponieważ Gunicorn importuje ten plik jako moduł, aby znaleźć 'app'.
