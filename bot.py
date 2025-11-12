@@ -52,10 +52,10 @@ else:
 CHANNEL_ID = 1429744335389458452
 WATCHER_GURU_CHANNEL_ID = 1429719129702535248 
 FIN_WATCH_CHANNEL_ID = 1429719129702535248
-WATCHER_GURU_RSS_URL = "https://rss.app/feeds/bP1lIE9lQ9hTBuSk.xml"
-FIN_WATCH_RSS_URL = "https://rss.app/feeds/R0DJZuoPNWe5yCMY.xml"
+WATCHER_GURU_RSS_URL = "https://watcher.guru/feed"
+
 WATCHER_GURU_SENT_URLS = deque(maxlen=200)
-FIN_WATCH_SENT_URLS = deque(maxlen=200)
+
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
 # --- Konfiguracja Gemini (POPRAWIONA) ---
@@ -70,6 +70,125 @@ gemini_safety_settings = [
 # Konfiguracja bezpieczeństwa dla generowania treści
 gemini_generation_config = types.GenerateContentConfig(safety_settings=gemini_safety_settings)
 
+
+# --- POCZĄTEK BLOKU: INTERAKTYWNY KALKULATOR MM ---
+
+# Upewnij się, że masz ten import na górze pliku, jeśli go brakuje:
+# import discord
+# from discord.ext import commands
+
+class KalkulatorMMModal(discord.ui.Modal, title="Kalkulator Wielkości Pozycji"):
+    """
+    Definicja interaktywnego okna (Modala) do obliczania
+    wielkości pozycji (Money Management).
+    """
+
+    # --- Pola formularza, które zobaczy użytkownik ---
+
+    balance = discord.ui.TextInput(
+        label="Całkowite Saldo Konta (np. 10000)",
+        placeholder="Wpisz swoje całkowite saldo w USD (tylko liczba)",
+        required=True,
+        style=discord.TextStyle.short
+    )
+
+    risk_percent = discord.ui.TextInput(
+        label="Ryzyko na transakcję w % (np. 1 lub 2)",
+        placeholder="Tylko liczba, np. '1' dla 1%",
+        required=True,
+        max_length=5 # Max 5 znaków, np. "1.25"
+    )
+
+    entry_price = discord.ui.TextInput(
+        label="Cena Wejścia (np. 60000)",
+        placeholder="Cena, po której planujesz kupić / shortować",
+        required=True
+    )
+
+    stop_loss = discord.ui.TextInput(
+        label="Cena Stop Loss (np. 59000)",
+        placeholder="Cena, po której zamykasz stratę",
+        required=True
+    )
+
+    # --- Logika po wysłaniu formularza ---
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """
+        Ta funkcja uruchamia się, gdy użytkownik kliknie "Wyślij" w formularzu.
+        """
+        try:
+            # 1. Pobieramy wartości z formularza i konwertujemy na liczby (float)
+            # Używamy .replace(',', '.'), aby akceptować zarówno kropki, jak i przecinki
+            balance_val = float(self.balance.value.replace(',', '.'))
+            risk_val = float(self.risk_percent.value.replace(',', '.'))
+            entry_val = float(self.entry_price.value.replace(',', '.'))
+            stop_val = float(self.stop_loss.value.replace(',', '.'))
+
+            # 2. Walidacja danych
+            if balance_val <= 0 or risk_val <= 0 or entry_val <= 0 or stop_val <= 0:
+                raise ValueError("Wszystkie wartości muszą być liczbami dodatnimi.")
+            
+            if entry_val == stop_val:
+                raise ValueError("Cena wejścia i Stop Loss nie mogą być takie same.")
+
+            # 3. Rozpoznanie typu pozycji (Long vs Short)
+            is_long = entry_val > stop_val
+            
+            if is_long:
+                # Pozycja DŁUGA (LONG)
+                risk_per_unit = entry_val - stop_val
+                position_type = "Long (Kupno)"
+            else:
+                # Pozycja KRÓTKA (SHORT)
+                risk_per_unit = stop_val - entry_val
+                position_type = "Short (Sprzedaż)"
+
+            # 4. Główne kalkulacje
+            amount_to_risk = balance_val * (risk_val / 100.0)
+            position_size = amount_to_risk / risk_per_unit
+            position_value_usd = position_size * entry_val
+
+            # 5. Tworzenie ładnej odpowiedzi (Embed)
+            embed = discord.Embed(
+                title="✅ Wynik Kalkulatora Money Management",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Twoje Dane Wejściowe", value=(
+                f"**Saldo:** `${balance_val:,.2f}`\n"
+                f"**Ryzyko:** `{risk_val:.2f}%`\n"
+                f"**Wejście:** `${entry_val:,.2f}`\n"
+                f"**Stop Loss:** `${stop_val:,.2f}`"
+            ), inline=True)
+            
+            embed.add_field(name="Zarządzanie Ryzykiem", value=(
+                f"**Typ Pozycji:** `{position_type}`\n"
+                f"**Kwota Ryzykowana:** `${amount_to_risk:,.2f}`\n"
+                f"**Ryzyko na 1 jednostkę:** `${risk_per_unit:,.2f}`"
+            ), inline=True)
+            
+            embed.add_field(name="Sugerowana Wielkość Pozycji", value=(
+                f"**Wielkość pozycji (np. w BTC/ETH):**\n"
+                f"`{position_size:.8f}` **jednostek**\n\n"
+                f"**Wartość tej pozycji w USD:**\n"
+                f"`${position_value_usd:,.2f}`"
+            ), inline=False)
+            
+            embed.set_footer(text="Ta wiadomość jest widoczna tylko dla Ciebie.")
+
+            # 6. Wysłanie odpowiedzi - `ephemeral=True` oznacza, że widzi ją tylko ten, co wywołał
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except ValueError as e:
+            # Obsługa błędu, jeśli ktoś wpisze "abc" zamiast "100"
+            await interaction.response.send_message(
+                f"BŁĄD! Wprowadziłeś niepoprawne dane. Upewnij się, że używasz tylko liczb (np. 10000 lub 1.5).\n*Szczegóły: {e}*",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"Wystąpił nieoczekiwany błąd: {e}", ephemeral=True)
+
+# --- KONIEC BLOKU: INTERAKTYWNY KALKULATOR MM ---
 
 if GEMINI_API_KEY:
     try:
@@ -363,6 +482,14 @@ async def slash_analysis(interaction: discord.Interaction):
     embed = discord.Embed(title="Analiza BTC & ETH", description=description_text, color=discord.Color.orange())
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="kalkulator", description="Otwiera interaktywny kalkulator Money Management (wielkość pozycji).")
+async def slash_kalkulator(interaction: discord.Interaction):
+    """
+    Wysyła do użytkownika interaktywny modal (okno)
+    do wypełnienia danych kalkulatora.
+    """
+    # Ta komenda po prostu tworzy instancję naszego Modala i go wysyła
+    await interaction.response.send_modal(KalkulatorMMModal())
 
 # --- Zdarzenia startowe i synchronizacja ---
 
@@ -445,14 +572,6 @@ async def watcher_guru_forwarder():
         await process_and_send_news(channel, entry, "Watcher Guru", WATCHER_GURU_SENT_URLS)
         await asyncio.sleep(1) 
 
-@tasks.loop(minutes=5)
-async def fin_watch_forwarder():
-    channel = bot.get_channel(FIN_WATCH_CHANNEL_ID)
-    if not channel: return
-    feed = feedparser.parse(FIN_WATCH_RSS_URL)
-    for entry in reversed(feed.entries[:5]): 
-        await process_and_send_news(channel, entry, "Fin Watch (Telegram)", FIN_WATCH_SENT_URLS)
-        await asyncio.sleep(1)
 
 # --- POPRAWKA WYWOŁANIA GEMINI ---
 async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
