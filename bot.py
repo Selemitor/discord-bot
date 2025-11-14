@@ -691,15 +691,42 @@ async def get_detailed_ai_analysis_embed():
 
 
 # --- ZAKTUALIZOWANA PĘTLA ---
+# --- ZAKTUALIZOWANA PĘTLA (z logiką ponowienia 3x5 min) ---
 @tasks.loop(hours=2)
 async def generate_gemini_news():
     if not gemini_client: return
     channel = bot.get_channel(CHANNEL_ID)
     if not channel: return
     
-    # Wywołujemy nową funkcję i wysyłamy wynik
-    analysis_embed = await get_detailed_ai_analysis_embed()
-    await channel.send(embed=analysis_embed)
+    # --- NOWA LOGIKA PONOWIENIA (zgodnie z prośbą) ---
+    max_task_retries = 3 # Ilość zewnętrznych prób (np. 3 razy)
+    wait_time_minutes = 5  # Czas oczekiwania między próbami (w minutach)
+    
+    for attempt in range(max_task_retries):
+        print(f"[Zadanie: generate_gemini_news] Próba {attempt + 1}/{max_task_retries} wygenerowania analizy...")
+        
+        # Krok 1: Wywołaj funkcję, która ma WŁASNĄ logikę (5xPro + 1xFlash)
+        analysis_embed = await get_detailed_ai_analysis_embed()
+        
+        # Krok 2: Sprawdzamy, czy embed jest sukcesem (NIE jest czerwony)
+        if analysis_embed and analysis_embed.color != discord.Color.red():
+            # SUKCES!
+            print(f"[Zadanie: generate_gemini_news] Sukces w próbie {attempt + 1}. Publikuję.")
+            await channel.send(embed=analysis_embed)
+            return # Zakończ funkcję, zadanie wykonane
+            
+        # Krok 3: BŁĄD (API przeciążone). Sprawdzamy, czy to ostatnia próba.
+        if attempt < max_task_retries - 1:
+            # To nie jest ostatnia próba, czekamy 5 minut
+            print(f"[Zadanie: generate_gemini_news] Błąd w próbie {attempt + 1}. API przeciążone.")
+            print(f"[Zadanie: generate_gemini_news] Czekam {wait_time_minutes} minut przed kolejną próbą...")
+            await asyncio.sleep(wait_time_minutes * 60) # Czekamy (w sekundach)
+        else:
+            # To była ostatnia (np. trzecia) próba i też się nie powiodła
+            print(f"[Zadanie: generate_gemini_news] Wszystkie {max_task_retries} próby nie powiodły się. Rezygnuję na ten cykl.")
+            # Nie wysyłamy nic na kanał i kończymy funkcję.
+            return
+    # --- KONIEC NOWEJ LOGIKI ---
 
 # --- ZAKTUALIZOWANA PĘTLA ---
 @tasks.loop(minutes=5)
