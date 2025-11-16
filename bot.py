@@ -692,7 +692,7 @@ async def get_detailed_ai_analysis_embed():
 
 # --- ZAKTUALIZOWANA PĘTLA ---
 # --- ZAKTUALIZOWANA PĘTLA (z logiką ponowienia 3x5 min) ---
-@tasks.loop(hours=2)
+@tasks.loop(hours=6)
 async def generate_gemini_news():
     if not gemini_client: return
     channel = bot.get_channel(CHANNEL_ID)
