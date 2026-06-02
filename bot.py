@@ -76,7 +76,8 @@ TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
 # --- Konfiguracja Gemini (POPRAWIONA) ---
 gemini_client = None
-gemini_model_name = 'gemini-2.5-pro' # Domyślny model dla ANALIZ
+gemini_disabled_reason = None
+gemini_model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-pro').strip() # Domyślny model dla ANALIZ
 gemini_safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -204,8 +205,7 @@ class KalkulatorMMModal(discord.ui.Modal, title="Kalkulator Wielkości Pozycji")
 
 if GEMINI_API_KEY:
     try:
-        # NOWA METODA: Tworzymy klienta. Klucz API jest pobierany automatycznie ze zmiennej środowiskowej.
-        gemini_client = genai.Client() 
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY.strip())
         print("Konfiguracja Gemini OK.")
     except Exception as e:
         print(f"Błąd konfiguracji Gemini: {e}")
@@ -443,6 +443,8 @@ def _generate_content_with_fallback(prompt: str, model_name: str):
     Uruchamia Gemini z logiką ponawiania prób i przełączania awaryjnego.
     Przyjmuje model_name, aby wiedzieć, który model ma być podstawowym.
     """
+    global gemini_client, gemini_disabled_reason
+
     if not gemini_client:
         raise Exception("Klient Gemini nie jest skonfigurowany.")
 
@@ -466,6 +468,11 @@ def _generate_content_with_fallback(prompt: str, model_name: str):
             return response
         except Exception as e:
             error_str = str(e)
+            if "location is not supported" in error_str.lower() or "FAILED_PRECONDITION" in error_str:
+                gemini_disabled_reason = "Gemini API jest niedostępne z lokalizacji/regionu tej usługi."
+                gemini_client = None
+                print(f"Wyłączam Gemini dla tego procesu: {gemini_disabled_reason}")
+                raise e
             # Sprawdzamy, czy to błąd przeciążenia (503) LUB limitu (429)
             if "503 UNAVAILABLE" in error_str or "overloaded" in error_str or "429 RESOURCE_EXHAUSTED" in error_str:
                 print(f" próba {attempt + 1}/{max_retries} na '{primary_model}' nie powiodła się (Limit/Przeciążenie). Próbuję ponownie...")
@@ -583,13 +590,48 @@ def get_market_risk_score(snapshot):
     }
 
 
-def get_ai_report_analysis():
-    if not gemini_client:
-        return "Analiza AI wyłączona (brak klucza)."
+def build_rule_based_market_report(snapshot, risk):
+    headlines = snapshot.get("latest_headlines") or []
+    headline_text = "; ".join(headlines[:3]) if headlines else "brak istotnych nagłówków w źródle RSS"
 
-    print("Pobieranie danych do raportu Pro Desk Morning Briefing (Model: PRO)...")
+    return (
+        f"**1. Sentyment i ryzyko:** Risk score wynosi {risk['score']}/100: {risk['label']}. "
+        f"Główne czynniki: {risk['reasons']}.\n"
+        f"**2. BTC / ETH / rynek:** {snapshot.get('market_overview', 'Brak danych rynkowych.')}\n"
+        f"**3. Altcoiny i momentum:** Największe wzrosty 24h:\n{snapshot.get('top_gainers', 'Brak danych.')}\n"
+        f"**4. Makro / wydarzenia:** {snapshot.get('fed_events', 'Brak danych makro.')}\n"
+        f"**5. Scenariusz na dziś:** Bazowo obserwuj kontynuację obecnego momentum, ale traktuj je ostrożnie, jeśli kapitalizacja rynku zacznie słabnąć lub sentyment stanie się skrajny.\n"
+        f"**6. Ryzyka:** Zmienność po danych makro oraz szybka rotacja kapitału w altcoinach. Najnowsze nagłówki: {headline_text}.\n"
+        "To nie jest porada inwestycyjna."
+    )
+
+
+def get_ai_error_message(error):
+    error_text = str(error)
+    lowered = error_text.lower()
+    if "location is not supported" in lowered or "failed_precondition" in lowered:
+        return "Gemini API jest niedostępne z lokalizacji/regionu tej usługi. Bot użył raportu regułowego na podstawie danych rynkowych."
+    if "api key" in lowered or "permission" in lowered or "unauthenticated" in lowered or "403" in error_text:
+        return "Nie udało się wygenerować briefingu AI. Sprawdź `GEMINI_API_KEY` oraz dostęp tego klucza do wybranego modelu."
+    if "not found" in lowered or "404" in error_text or "model" in lowered:
+        return "Nie udało się wygenerować briefingu AI. Wybrany model Gemini może być niedostępny dla tego klucza. Ustaw `GEMINI_MODEL_NAME=gemini-2.5-flash` i wdroż ponownie."
+    if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
+        return "Nie udało się wygenerować briefingu AI. Limit Gemini został chwilowo wyczerpany."
+    if "503" in error_text or "overloaded" in lowered or "unavailable" in lowered:
+        return "Nie udało się wygenerować briefingu AI. Model Gemini jest chwilowo przeciążony."
+    return "Nie udało się wygenerować profesjonalnego raportu z powodu błędu Gemini. Szczegóły są w logach Render."
+
+
+def get_ai_report_analysis():
     market_data = get_realtime_market_snapshot()
     risk = get_market_risk_score(market_data)
+
+    if not gemini_client:
+        reason = gemini_disabled_reason or "brak aktywnego klienta Gemini"
+        print(f"Gemini niedostępne ({reason}). Generuję raport regułowy.")
+        return build_rule_based_market_report(market_data, risk)
+
+    print(f"Pobieranie danych do raportu Pro Desk Morning Briefing (Model: {gemini_model_name})...")
     headlines_str = "\n- ".join(market_data['latest_headlines'])
     current_date = datetime.datetime.now(TZ_POLAND).strftime("%Y-%m-%d %H:%M")
 
@@ -619,11 +661,12 @@ def get_ai_report_analysis():
             "Zakończ krótko: 'To nie jest porada inwestycyjna.'"
         )
 
-        response = _generate_content_with_fallback(prompt, model_name='gemini-2.5-pro')
+        response = _generate_content_with_fallback(prompt, model_name=gemini_model_name)
         return response.text.strip()
     except Exception as e:
         print(f"Błąd podczas generowania raportu Pro Desk Morning Briefing: {e}")
-        return "Nie udało się wygenerować profesjonalnego raportu z powodu błędu."
+        fallback = build_rule_based_market_report(market_data, risk)
+        return f"{fallback}\n\n_Notatka techniczna: {get_ai_error_message(e)}_"
 
 
 def _fit_embed_value(value, limit=1024):
