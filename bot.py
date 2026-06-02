@@ -9,17 +9,13 @@ import datetime
 from datetime import date, timedelta
 import csv
 import io
-import feedparser
 import time
 import numpy as np
-from bs4 import BeautifulSoup
-from collections import deque
 import asyncio
 import re
 from zoneinfo import ZoneInfo
 from threading import Thread # <-- WAŻNE: Importujemy wątki
 from flask import Flask # <-- WAŻNE: Importujemy Flask
-import json # <-- DODANO IMPORT DLA TRWAŁEJ PAMIĘCI
 
 # Wymaga instalacji: google-genai
 from google import genai
@@ -52,25 +48,9 @@ else:
 
 # --- Reszta Konfiguracji ---
 CHANNEL_ID = 1429744335389458452
-WATCHER_GURU_CHANNEL_ID = 1429719129702535248 
-WATCHER_GURU_RSS_URL = "https://watcher.guru/feed"
-
-WATCHER_GURU_SENT_URLS = deque(maxlen=200)
-SENT_URLS_FILE = "sent_urls.json" # <-- NOWA LINIA: Nazwa pliku dla pamięci
-
-def load_sent_urls_from_file():
-    """Wczytuje URL-e z pliku do globalnego deque przy starcie."""
-    global WATCHER_GURU_SENT_URLS # Używamy globalnej zmiennej
-    try:
-        with open(SENT_URLS_FILE, 'r') as f:
-            urls_list = json.load(f)
-            # Nadpisujemy domyślne puste deque zawartością pliku
-            WATCHER_GURU_SENT_URLS = deque(urls_list, maxlen=200)
-            print(f"Załadowano {len(WATCHER_GURU_SENT_URLS)} URL-i z pliku {SENT_URLS_FILE}.")
-    except FileNotFoundError:
-        print(f"Plik {SENT_URLS_FILE} nie znaleziony, startuję z pustą listą.")
-    except Exception as e:
-        print(f"Błąd ładowania URL-i z pliku: {e}")
+VOLATILITY_ALERT_THRESHOLD = float(os.environ.get('VOLATILITY_ALERT_THRESHOLD', '5'))
+VOLATILITY_ALERT_COINS = ["bitcoin", "ethereum"]
+volatility_alert_sent = {}
 
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
@@ -78,6 +58,8 @@ TZ_POLAND = ZoneInfo("Europe/Warsaw")
 gemini_client = None
 gemini_disabled_reason = None
 gemini_model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-pro').strip() # Domyślny model dla ANALIZ
+market_report_cache = {"timestamp": None, "text": None}
+MARKET_REPORT_CACHE_SECONDS = int(os.environ.get('MARKET_REPORT_CACHE_SECONDS', '1800'))
 gemini_safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -206,7 +188,7 @@ class KalkulatorMMModal(discord.ui.Modal, title="Kalkulator Wielkości Pozycji")
 if GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY.strip())
-        print("Konfiguracja Gemini OK.")
+        print(f"Konfiguracja Gemini OK. Model raportu: {gemini_model_name}.")
     except Exception as e:
         print(f"Błąd konfiguracji Gemini: {e}")
         gemini_client = None
@@ -244,6 +226,16 @@ def run_discord_bot_sync():
 def get_fear_and_greed_image():
     timestamp = int(time.time())
     return f"https://alternative.me/crypto/fear-and-greed-index.png?v={timestamp}"
+
+def format_usd(value, decimals=2):
+    if value is None:
+        return "brak danych"
+    return f"${value:,.{decimals}f}"
+
+def format_pct(value):
+    if value is None:
+        return "brak danych"
+    return f"{value:+.2f}%"
 
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -317,7 +309,7 @@ def get_market_overview():
                 "vs_currency": "usd",
                 "ids": "bitcoin,ethereum,solana,binancecoin,ripple",
                 "order": "market_cap_desc",
-                "per_page": 3,
+                "per_page": 5,
                 "page": 1,
                 "price_change_percentage": "24h,7d"
             },
@@ -436,6 +428,133 @@ def get_single_coin_analysis(coin_id: str):
         return f"Błąd analizy dla {coin_id}.", None
 # --- KONIEC NOWEJ FUNKCJI ---
 
+def get_coin_technical_snapshot(coin_id: str):
+    if not COINGECKO_API_KEY:
+        raise ValueError("Brak klucza API CoinGecko.")
+
+    headers = {'x-cg-demo-api-key': COINGECKO_API_KEY.strip()}
+    markets_response = requests.get(
+        "https://api.coingecko.com/api/v3/coins/markets",
+        params={
+            "vs_currency": "usd",
+            "ids": coin_id,
+            "price_change_percentage": "24h,7d"
+        },
+        headers=headers,
+        timeout=10
+    )
+    markets_response.raise_for_status()
+    markets = markets_response.json()
+    if not markets:
+        raise ValueError(f"Nie znaleziono kryptowaluty `{coin_id}`.")
+
+    chart_response = requests.get(
+        f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+        params={"vs_currency": "usd", "days": 30},
+        headers=headers,
+        timeout=10
+    )
+    chart_response.raise_for_status()
+    prices = [p[1] for p in chart_response.json().get("prices", [])]
+    if len(prices) < 15:
+        raise ValueError(f"Za mało danych cenowych dla `{coin_id}`.")
+
+    market = markets[0]
+    current_price = market.get("current_price") or prices[-1]
+    points_7d = min(len(prices), 7 * 24)
+    prices_7d = prices[-points_7d:]
+    rsi = calculate_rsi(prices)
+    support = min(prices_7d)
+    resistance = max(prices_7d)
+    distance_to_support = ((current_price - support) / current_price) * 100 if current_price else 0
+    distance_to_resistance = ((resistance - current_price) / current_price) * 100 if current_price else 0
+
+    if rsi >= 70:
+        condition = "wykupienie"
+    elif rsi <= 30:
+        condition = "wyprzedanie"
+    else:
+        condition = "neutralnie"
+
+    return {
+        "id": coin_id,
+        "name": market.get("name", coin_id.capitalize()),
+        "symbol": market.get("symbol", "").upper(),
+        "price": current_price,
+        "change_24h": market.get("price_change_percentage_24h"),
+        "change_7d": market.get("price_change_percentage_7d_in_currency"),
+        "rsi": rsi,
+        "condition": condition,
+        "support": support,
+        "resistance": resistance,
+        "distance_to_support": distance_to_support,
+        "distance_to_resistance": distance_to_resistance,
+        "volume": market.get("total_volume"),
+        "market_cap": market.get("market_cap")
+    }
+
+def format_coin_technical_report(snapshot):
+    scenario = "Scenariusz bazowy: obserwuj reakcję ceny między wsparciem i oporem."
+    invalidation = "Unieważnienie: wybicie poza wskazany zakres 7D przy rosnącym wolumenie."
+    if snapshot["rsi"] >= 70:
+        scenario = "Scenariusz bazowy: momentum jest mocne, ale rynek może być podatny na realizację zysków."
+        invalidation = "Unieważnienie: utrzymanie ceny powyżej oporu i schłodzenie RSI bez spadku ceny."
+    elif snapshot["rsi"] <= 30:
+        scenario = "Scenariusz bazowy: rynek jest technicznie wyprzedany, możliwe odbicie korekcyjne."
+        invalidation = "Unieważnienie: utrata wsparcia 7D i dalszy wzrost wolumenu sprzedaży."
+
+    return (
+        f"**Cena:** `{format_usd(snapshot['price'])}`\n"
+        f"**Zmiana:** `{format_pct(snapshot['change_24h'])} 24h`, `{format_pct(snapshot['change_7d'])} 7d`\n"
+        f"**RSI 14D:** `{snapshot['rsi']:.2f}` ({snapshot['condition']})\n"
+        f"**Wsparcie 7D:** `{format_usd(snapshot['support'])}` ({snapshot['distance_to_support']:.2f}% niżej)\n"
+        f"**Opór 7D:** `{format_usd(snapshot['resistance'])}` ({snapshot['distance_to_resistance']:.2f}% wyżej)\n"
+        f"**Wolumen 24h:** `{format_usd(snapshot['volume'], 0)}`\n\n"
+        f"{scenario}\n{invalidation}\n"
+        "To nie jest porada inwestycyjna."
+    )
+
+def get_core_technical_overview():
+    lines = []
+    for coin_id in ("bitcoin", "ethereum"):
+        try:
+            snapshot = get_coin_technical_snapshot(coin_id)
+            lines.append(
+                f"- **{snapshot['symbol']}**: `{format_usd(snapshot['price'])}`, "
+                f"{format_pct(snapshot['change_24h'])} 24h, RSI `{snapshot['rsi']:.1f}`, "
+                f"wsparcie `{format_usd(snapshot['support'])}`, opór `{format_usd(snapshot['resistance'])}`"
+            )
+        except Exception as e:
+            lines.append(f"- **{coin_id.upper()}**: błąd pobierania danych ({e})")
+    return "\n".join(lines)
+
+def get_volatility_alerts():
+    alerts = []
+    today_key = date.today().isoformat()
+    for coin_id in VOLATILITY_ALERT_COINS:
+        try:
+            snapshot = get_coin_technical_snapshot(coin_id)
+        except Exception as e:
+            print(f"Błąd alertu zmienności dla {coin_id}: {e}")
+            continue
+
+        change = snapshot.get("change_24h")
+        if change is None or abs(change) < VOLATILITY_ALERT_THRESHOLD:
+            continue
+
+        alert_key = f"{today_key}:{coin_id}:{'up' if change > 0 else 'down'}"
+        if volatility_alert_sent.get(alert_key):
+            continue
+
+        direction = "wzrost" if change > 0 else "spadek"
+        alerts.append(
+            f"**{snapshot['name']} ({snapshot['symbol']})**: {direction} `{format_pct(change)}` w 24h. "
+            f"Cena `{format_usd(snapshot['price'])}`, RSI `{snapshot['rsi']:.1f}`, "
+            f"wsparcie `{format_usd(snapshot['support'])}`, opór `{format_usd(snapshot['resistance'])}`."
+        )
+        volatility_alert_sent[alert_key] = True
+    return alerts
+
 
 # --- NOWA ZAKTUALIZOWANA FUNKCJA POMOCNICZA DLA GEMINI ---
 def _generate_content_with_fallback(prompt: str, model_name: str):
@@ -473,14 +592,15 @@ def _generate_content_with_fallback(prompt: str, model_name: str):
                 gemini_client = None
                 print(f"Wyłączam Gemini dla tego procesu: {gemini_disabled_reason}")
                 raise e
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+                gemini_disabled_reason = "Limit Gemini został wyczerpany dla tego projektu/modelu."
+                gemini_client = None
+                print(f"Wyłączam Gemini dla tego procesu: {gemini_disabled_reason}")
+                raise e
             # Sprawdzamy, czy to błąd przeciążenia (503) LUB limitu (429)
-            if "503 UNAVAILABLE" in error_str or "overloaded" in error_str or "429 RESOURCE_EXHAUSTED" in error_str:
-                print(f" próba {attempt + 1}/{max_retries} na '{primary_model}' nie powiodła się (Limit/Przeciążenie). Próbuję ponownie...")
-                # Czekamy dłużej przy błędach 429 (bo mówią nam, ile czekać), a krócej przy 503
-                if "retryDelay" in error_str:
-                    time.sleep(7) # Czekamy 7s, aby zmieścić się w limicie 10 RPM flasha
-                else:
-                    time.sleep(1 + attempt) # Prosty backoff dla 503
+            if "503 UNAVAILABLE" in error_str or "overloaded" in error_str:
+                print(f" próba {attempt + 1}/{max_retries} na '{primary_model}' nie powiodła się (przeciążenie). Próbuję ponownie...")
+                time.sleep(1 + attempt)
                 continue # Przejdź do kolejnej próby
             else:
                 # Jeśli to inny błąd (np. 400 Bad Request), przerwij od razu
@@ -511,9 +631,9 @@ def get_realtime_market_snapshot():
     snapshot = {
         "fear_greed": "Brak danych",
         "market_overview": "Brak danych",
+        "technical_overview": "Brak danych",
         "top_gainers": "Brak danych",
-        "fed_events": "Brak danych",
-        "latest_headlines": []
+        "fed_events": "Brak danych"
     }
     try:
         response = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
@@ -524,14 +644,9 @@ def get_realtime_market_snapshot():
         print(f"Błąd pobierania Fear & Greed: {e}")
 
     snapshot['market_overview'] = get_market_overview()
+    snapshot['technical_overview'] = get_core_technical_overview()
     snapshot['top_gainers'] = get_top_gainers(3)
     snapshot['fed_events'] = get_fed_events()
-    try:
-        feed = feedparser.parse(WATCHER_GURU_RSS_URL)
-        snapshot['latest_headlines'] = [entry.title for entry in feed.entries[:5]]
-    except Exception as e:
-        print(f"Błąd pobierania nagłówków RSS: {e}")
-        snapshot['latest_headlines'] = ["Brak danych o newsach."]
     return snapshot
 
 def get_market_risk_score(snapshot):
@@ -591,17 +706,14 @@ def get_market_risk_score(snapshot):
 
 
 def build_rule_based_market_report(snapshot, risk):
-    headlines = snapshot.get("latest_headlines") or []
-    headline_text = "; ".join(headlines[:3]) if headlines else "brak istotnych nagłówków w źródle RSS"
-
     return (
         f"**1. Sentyment i ryzyko:** Risk score wynosi {risk['score']}/100: {risk['label']}. "
         f"Główne czynniki: {risk['reasons']}.\n"
         f"**2. BTC / ETH / rynek:** {snapshot.get('market_overview', 'Brak danych rynkowych.')}\n"
-        f"**3. Altcoiny i momentum:** Największe wzrosty 24h:\n{snapshot.get('top_gainers', 'Brak danych.')}\n"
-        f"**4. Makro / wydarzenia:** {snapshot.get('fed_events', 'Brak danych makro.')}\n"
-        f"**5. Scenariusz na dziś:** Bazowo obserwuj kontynuację obecnego momentum, ale traktuj je ostrożnie, jeśli kapitalizacja rynku zacznie słabnąć lub sentyment stanie się skrajny.\n"
-        f"**6. Ryzyka:** Zmienność po danych makro oraz szybka rotacja kapitału w altcoinach. Najnowsze nagłówki: {headline_text}.\n"
+        f"**3. Poziomy techniczne:**\n{snapshot.get('technical_overview', 'Brak danych technicznych.')}\n"
+        f"**4. Altcoiny i momentum:** Największe wzrosty 24h:\n{snapshot.get('top_gainers', 'Brak danych.')}\n"
+        f"**5. Makro / wydarzenia:** {snapshot.get('fed_events', 'Brak danych makro.')}\n"
+        f"**6. Scenariusz i ryzyka:** Bazowo obserwuj reakcję ceny przy poziomach wsparcia/oporu. Główne ryzyka: zmienność po danych makro, szybka rotacja kapitału w altcoinach oraz skrajne odczyty sentymentu.\n"
         "To nie jest porada inwestycyjna."
     )
 
@@ -623,16 +735,25 @@ def get_ai_error_message(error):
 
 
 def get_ai_report_analysis():
+    now_ts = time.time()
+    cached_text = market_report_cache.get("text")
+    cached_ts = market_report_cache.get("timestamp")
+    if cached_text and cached_ts and now_ts - cached_ts < MARKET_REPORT_CACHE_SECONDS:
+        print("Używam cache raportu rynkowego.")
+        return cached_text
+
     market_data = get_realtime_market_snapshot()
     risk = get_market_risk_score(market_data)
 
     if not gemini_client:
         reason = gemini_disabled_reason or "brak aktywnego klienta Gemini"
         print(f"Gemini niedostępne ({reason}). Generuję raport regułowy.")
-        return build_rule_based_market_report(market_data, risk)
+        report = build_rule_based_market_report(market_data, risk)
+        market_report_cache["timestamp"] = now_ts
+        market_report_cache["text"] = report
+        return report
 
     print(f"Pobieranie danych do raportu Pro Desk Morning Briefing (Model: {gemini_model_name})...")
-    headlines_str = "\n- ".join(market_data['latest_headlines'])
     current_date = datetime.datetime.now(TZ_POLAND).strftime("%Y-%m-%d %H:%M")
 
     try:
@@ -645,28 +766,34 @@ def get_ai_report_analysis():
             f"Fear & Greed Index: {market_data['fear_greed']}\n"
             f"Risk score systemowy: {risk['score']}/100 - {risk['label']} ({risk['reasons']})\n"
             f"Przeglad rynku:\n{market_data['market_overview']}\n"
+            f"Poziomy techniczne BTC/ETH:\n{market_data['technical_overview']}\n"
             f"Największe wzrosty 24h:\n{market_data['top_gainers']}\n"
             f"Makro/FED:\n{market_data['fed_events']}\n"
-            f"Najnowsze nagłówki:\n- {headlines_str}\n"
             "--- KONIEC DANYCH ---\n\n"
             "Napisz raport po polsku w stylu profesjonalnego biurka analitycznego. "
             "Maksymalnie 950 znaków, bez lania wody, bez emoji, bez markdownowych tabel. "
             "Użyj dokładnie tych sekcji:\n"
             "**1. Sentyment i ryzyko:** 1-2 zdania.\n"
             "**2. BTC / ETH / rynek:** 2-3 zdania o kierunku, dominacji, kapitalizacji i głównych aktywach.\n"
-            "**3. Altcoiny i momentum:** 1-2 zdania o największych wzrostach i rotacji kapitału.\n"
-            "**4. Makro / wydarzenia:** 1 zdanie, jeśli dane są dostępne; jeśli nie, napisz czego brakuje.\n"
-            "**5. Scenariusz na dziś:** bazowy scenariusz oraz warunek jego unieważnienia.\n"
-            "**6. Ryzyka:** 2 najważniejsze punkty ryzyka.\n"
+            "**3. Poziomy techniczne:** 1-2 zdania o RSI, wsparciu i oporze BTC/ETH.\n"
+            "**4. Altcoiny i momentum:** 1-2 zdania o największych wzrostach i rotacji kapitału.\n"
+            "**5. Makro / wydarzenia:** 1 zdanie, jeśli dane są dostępne; jeśli nie, napisz czego brakuje.\n"
+            "**6. Scenariusz i ryzyka:** bazowy scenariusz, warunek unieważnienia i 2 najważniejsze ryzyka.\n"
             "Zakończ krótko: 'To nie jest porada inwestycyjna.'"
         )
 
         response = _generate_content_with_fallback(prompt, model_name=gemini_model_name)
-        return response.text.strip()
+        report = response.text.strip()
+        market_report_cache["timestamp"] = now_ts
+        market_report_cache["text"] = report
+        return report
     except Exception as e:
         print(f"Błąd podczas generowania raportu Pro Desk Morning Briefing: {e}")
         fallback = build_rule_based_market_report(market_data, risk)
-        return f"{fallback}\n\n_Notatka techniczna: {get_ai_error_message(e)}_"
+        report = f"{fallback}\n\n_Notatka techniczna: {get_ai_error_message(e)}_"
+        market_report_cache["timestamp"] = now_ts
+        market_report_cache["text"] = report
+        return report
 
 
 def _fit_embed_value(value, limit=1024):
@@ -736,10 +863,52 @@ async def slash_market(interaction: discord.Interaction):
         color=discord.Color.from_rgb(70, 130, 180)
     )
     embed.add_field(name="Rynek", value=_fit_embed_value(snapshot["market_overview"], 1024), inline=False)
+    embed.add_field(name="Poziomy BTC/ETH", value=_fit_embed_value(snapshot["technical_overview"], 1024), inline=False)
     embed.add_field(name="Momentum 24h", value=_fit_embed_value(snapshot["top_gainers"], 1024), inline=False)
     embed.add_field(name="Makro/FED", value=_fit_embed_value(snapshot["fed_events"], 1024), inline=False)
     embed.set_footer(text=f"Europe/Warsaw | {datetime.datetime.now(TZ_POLAND).strftime('%Y-%m-%d %H:%M')}")
     await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="risk", description="Pokazuje dashboard ryzyka rynku krypto.")
+async def slash_risk(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    snapshot = await asyncio.to_thread(get_realtime_market_snapshot)
+    risk = get_market_risk_score(snapshot)
+    embed = discord.Embed(
+        title="Dashboard ryzyka rynku krypto",
+        description=f"**{risk['score']}/100** - **{risk['label']}**\n{risk['reasons']}",
+        color=discord.Color.red() if risk["score"] >= 70 else discord.Color.orange() if risk["score"] >= 55 else discord.Color.green()
+    )
+    embed.add_field(name="Sentyment", value=snapshot["fear_greed"], inline=True)
+    embed.add_field(name="Rynek", value=_fit_embed_value(snapshot["market_overview"], 1024), inline=False)
+    embed.add_field(name="BTC/ETH technicznie", value=_fit_embed_value(snapshot["technical_overview"], 1024), inline=False)
+    embed.set_footer(text=f"Europe/Warsaw | {datetime.datetime.now(TZ_POLAND).strftime('%Y-%m-%d %H:%M')}")
+    await interaction.followup.send(embed=embed)
+
+async def send_coin_report(interaction: discord.Interaction, coin_id: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        snapshot = await asyncio.to_thread(get_coin_technical_snapshot, coin_id)
+        embed = discord.Embed(
+            title=f"{snapshot['name']} ({snapshot['symbol']}) - raport techniczny",
+            description=format_coin_technical_report(snapshot),
+            color=discord.Color.orange()
+        )
+    except Exception as e:
+        embed = discord.Embed(
+            title=f"Błąd raportu dla {coin_id}",
+            description=str(e),
+            color=discord.Color.red()
+        )
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="btc", description="Pokazuje szybki raport techniczny BTC.")
+async def slash_btc(interaction: discord.Interaction):
+    await send_coin_report(interaction, "bitcoin")
+
+@bot.tree.command(name="eth", description="Pokazuje szybki raport techniczny ETH.")
+async def slash_eth(interaction: discord.Interaction):
+    await send_coin_report(interaction, "ethereum")
 
 @bot.tree.command(name="fg", description="Wyświetla aktualny indeks Fear & Greed.")
 async def slash_fg(interaction: discord.Interaction):
@@ -819,11 +988,9 @@ async def slash_analiza_ai(interaction: discord.Interaction):
 async def on_ready():
     print(f'Zalogowano jako {bot.user}')
     try:
-        load_sent_urls_from_file() # <-- NOWA LINIA: Wczytaj historię
-        
         # Sprawdzanie, czy taski już działają, aby uniknąć restartu
         if not report_0800.is_running(): report_0800.start()
-        if not watcher_guru_forwarder.is_running(): watcher_guru_forwarder.start()
+        if not volatility_alert_loop.is_running(): volatility_alert_loop.start()
         
         # POPRAWKA: Usunięto wywołanie fin_watch_forwarder (z Twojego kodu)
         
@@ -842,16 +1009,25 @@ async def report_0800():
     title = f"Profesjonalny Raport Krypto - {date.today().strftime('%d-%m-%Y')} 08:00"
     await send_market_report(channel, title, discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_ai_analysis=True)
 
+@tasks.loop(minutes=30)
+async def volatility_alert_loop():
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+
+    alerts = await asyncio.to_thread(get_volatility_alerts)
+    for alert in alerts:
+        embed = discord.Embed(
+            title=f"Alert zmienności >= {VOLATILITY_ALERT_THRESHOLD:.1f}% 24h",
+            description=alert,
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=f"Europe/Warsaw | {datetime.datetime.now(TZ_POLAND).strftime('%Y-%m-%d %H:%M')}")
+        await channel.send(embed=embed)
+
 
 # --- Szczegółowa analiza na żądanie ---
 async def get_detailed_ai_analysis_embed():
-    if not gemini_client:
-        return discord.Embed(
-            title="Szczegółowa analiza rynku",
-            description="Analiza AI jest wyłączona. Brakuje klucza API Gemini.",
-            color=discord.Color.red()
-        )
-
     analysis_text = await asyncio.to_thread(get_ai_report_analysis)
     embed = discord.Embed(
         title="Szczegółowa analiza rynku",
@@ -860,135 +1036,6 @@ async def get_detailed_ai_analysis_embed():
     )
     embed.set_footer(text=f"Gemini AI | Europe/Warsaw | {datetime.datetime.now(TZ_POLAND).strftime('%Y-%m-%d %H:%M')}")
     return embed
-
-
-# --- ZAKTUALIZOWANA PĘTLA ---
-# --- ZAKTUALIZOWANA PĘTLA (z logiką ponowienia 3x5 min) ---
-@tasks.loop(hours=2)
-async def generate_gemini_news():
-    if not gemini_client: return
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel: return
-    
-    # --- NOWA LOGIKA PONOWIENIA (zgodnie z prośbą) ---
-    max_task_retries = 3 # Ilość zewnętrznych prób (np. 3 razy)
-    wait_time_minutes = 5  # Czas oczekiwania między próbami (w minutach)
-    
-    for attempt in range(max_task_retries):
-        print(f"[Zadanie: generate_gemini_news] Próba {attempt + 1}/{max_task_retries} wygenerowania analizy...")
-        
-        # Krok 1: Wywołaj funkcję, która ma WŁASNĄ logikę (5xPro + 1xFlash)
-        analysis_embed = await get_detailed_ai_analysis_embed()
-        
-        # Krok 2: Sprawdzamy, czy embed jest sukcesem (NIE jest czerwony)
-        if analysis_embed and analysis_embed.color != discord.Color.red():
-            # SUKCES!
-            print(f"[Zadanie: generate_gemini_news] Sukces w próbie {attempt + 1}. Publikuję.")
-            await channel.send(embed=analysis_embed)
-            return # Zakończ funkcję, zadanie wykonane
-            
-        # Krok 3: BŁĄD (API przeciążone). Sprawdzamy, czy to ostatnia próba.
-        if attempt < max_task_retries - 1:
-            # To nie jest ostatnia próba, czekamy 5 minut
-            print(f"[Zadanie: generate_gemini_news] Błąd w próbie {attempt + 1}. API przeciążone.")
-            print(f"[Zadanie: generate_gemini_news] Czekam {wait_time_minutes} minut przed kolejną próbą...")
-            await asyncio.sleep(wait_time_minutes * 60) # Czekamy (w sekundach)
-        else:
-            # To była ostatnia (np. trzecia) próba i też się nie powiodła
-            print(f"[Zadanie: generate_gemini_news] Wszystkie {max_task_retries} próby nie powiodły się. Rezygnuję na ten cykl.")
-            # Nie wysyłamy nic na kanał i kończymy funkcję.
-            return
-    # --- KONIEC NOWEJ LOGIKI ---
-
-# --- ZAKTUALIZOWANA PĘTLA ---
-@tasks.loop(minutes=5)
-async def watcher_guru_forwarder():
-    channel = bot.get_channel(WATCHER_GURU_CHANNEL_ID)
-    if not channel: return
-    feed = feedparser.parse(WATCHER_GURU_RSS_URL)
-    for entry in reversed(feed.entries[:5]): 
-        await process_and_send_news(channel, entry, "Watcher Guru", WATCHER_GURU_SENT_URLS)
-        # Czekamy 7s, aby zmieścić się w limicie 10 RPM (1 co 6s) dla modelu 'flash'
-        await asyncio.sleep(7) 
-
-
-# --- ZAKTUALIZOWANA FUNKCJA (Z DODANYM ZAPISEM DO PLIKU) ---
-async def process_and_send_news(channel, entry, source_name, sent_urls_deque):
-    if entry.link in sent_urls_deque: return
-    
-    tags_to_remove = ["@WatcherGuru", "@WatcherGur", "@WatcherGu", "@WatcherG", "@Watcher", "@Watche", "@Watch", "@Watc", "@FINNWatch", "@Fin_Watch", "@Finn", "@Fin"]
-    title_original = entry.title
-    for tag in tags_to_remove:
-        title_original = title_original.replace(tag, "")
-    title_original = title_original.strip()
-
-    title_pl = title_original # Domyślnie, jeśli AI zawiedzie
-    if gemini_client: # Tłumaczymy tylko jeśli AI jest dostępne
-        try:
-            prompt = (f"Jesteś profesjonalnym tłumaczem dla kanału informacyjnego. Twoim zadaniem jest stworzenie jednego, zwięzłego i naturalnie brzmiącego tłumaczenia. Nie podawaj żadnych alternatyw, wariantów w nawiasach, uwag ani dodatkowych wyjaśnień. Podaj tylko ostateczną, najlepszą wersję.\n\nPrzetłumacz na polski: \"{title_original}\"")
-            
-            # NOWA METODA: Wywołujemy funkcję pomocniczą z modelem 'flash'
-            print(f"Rozpoczynam tłumaczenie (Model: FLASH)...: {title_original}")
-            response = await asyncio.to_thread(
-                _generate_content_with_fallback,
-                prompt,
-                model_name='gemini-2.5-flash'
-            )
-            title_pl = response.text.strip()
-        except Exception as e:
-            print(f"Błąd tłumaczenia Gemini: {e}")
-            # W razie błędu, używamy oryginalnego tytułu
-            title_pl = title_original
-    
-    # --- NOWA, ZAKTUALIZOWANA LOGIKA WYSZUKIWANIA OBRAZKA ---
-    image_url = None
-
-    # Metoda 1: Sprawdź 'media_content' (często w Atom)
-    if 'media_content' in entry and entry.media_content:
-        image_url = next((media['url'] for media in entry.media_content if 'image' in media.get('type', '')), None)
-
-    # Metoda 2: Sprawdź 'enclosures' (standard RSS, tak jak było)
-    if not image_url and 'enclosures' in entry:
-        image_url = next((enc.href for enc in entry.enclosures if 'image' in enc.get('type', '')), None)
-
-    # Metoda 3: Sprawdź 'media:thumbnail' (popularny tag w RSS)
-    if not image_url and 'media_thumbnail' in entry:
-        image_url = entry.media_thumbnail[0].get('url')
-
-    # Metoda 4: Przeszukaj treść (summary/content) w poszukiwaniu tagu <img>
-    # (Twój skrypt już importuje BeautifulSoup, więc to zadziała)
-    if not image_url:
-        content_html = entry.get('summary', '') or entry.get('content', [{}])[0].get('value', '')
-        if content_html:
-            try:
-                soup = BeautifulSoup(content_html, 'html.parser')
-                img_tag = soup.find('img') # Znajdź pierwszy tag <img>
-                if img_tag and img_tag.has_attr('src'):
-                    image_url = img_tag['src']
-            except Exception as e:
-                print(f"Błąd parsowania HTML (BeautifulSoup): {e}")
-    # --- KONIEC NOWEJ LOGIKI ---
-    
-    embed = discord.Embed(title=f"📰 {source_name.replace('Watcher Guru', 'Wiadomosci').replace('Fin Watch (Telegram)', 'Wiadomosci Finansowe')}", description=f"**{title_pl}**", color=discord.Color.dark_blue())
-    
-    # Ta część pozostaje bez zmian, ale teraz image_url ma większą szansę istnieć
-    if image_url:
-        embed.set_image(url=image_url)
-    else:
-        # Ten log pomoże Ci sprawdzić, czy obrazki faktycznie są znajdowane
-        print(f"[DEBUG] Nie znaleziono obrazka dla: {title_original}")
-
-    await channel.send(embed=embed)
-    
-    # --- NOWA LOGIKA ZAPISU DO PLIKU ---
-    sent_urls_deque.append(entry.link) # Dodaj do pamięci RAM
-    try:
-        # Zapisz całą kolejkę (jako listę) do pliku, aby przetrwać restart
-        with open(SENT_URLS_FILE, 'w') as f:
-            json.dump(list(sent_urls_deque), f)
-    except Exception as e:
-        print(f"KRYTYCZNY BŁĄD zapisu URL do pliku: {e}")
-    # --- KONIEC NOWEJ LOGIKI ZAPISU ---
 
 
 # --- GŁÓWNE URUCHOMIENIE (Flask przez Gunicorn, Bot w wątku) ---
