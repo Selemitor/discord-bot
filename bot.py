@@ -790,7 +790,8 @@ def get_ai_report_analysis():
     except Exception as e:
         print(f"Błąd podczas generowania raportu Pro Desk Morning Briefing: {e}")
         fallback = build_rule_based_market_report(market_data, risk)
-        report = f"{fallback}\n\n_Notatka techniczna: {get_ai_error_message(e)}_"
+        print(f"Fallback raportu regułowego: {get_ai_error_message(e)}")
+        report = fallback
         market_report_cache["timestamp"] = now_ts
         market_report_cache["text"] = report
         return report
