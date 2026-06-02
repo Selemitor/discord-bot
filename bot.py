@@ -830,18 +830,17 @@ async def send_market_report(channel_or_ctx,
 
     if include_ai_analysis:
         ai_summary = await asyncio.to_thread(get_ai_report_analysis)
-        main_embed.add_field(name="Briefing analityczny", value=_fit_embed_value(ai_summary, 1024), inline=False)
+        main_embed.description = _fit_embed_value(ai_summary, 4096)
 
-    if include_gainers:
+    if include_gainers and not include_ai_analysis:
         gainers_text = await asyncio.to_thread(get_top_gainers, 10)
         main_embed.add_field(name="Momentum: największe wzrosty 24h", value=_fit_embed_value(gainers_text, 1024), inline=False)
 
-    if include_fed:
+    if include_fed and not include_ai_analysis:
         fed_text = await asyncio.to_thread(get_fed_events)
         main_embed.add_field(name="Makro: FED / wydarzenia 14 dni", value=_fit_embed_value(fed_text, 1024), inline=False)
 
-    if main_embed.fields:
-        await followup_send(embed=main_embed)
+    await followup_send(embed=main_embed)
 
 
 # --- Komendy ukosnikowe ---
