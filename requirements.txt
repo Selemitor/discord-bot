@@ -2,9 +2,5 @@ discord.py
 requests
 python-dotenv
 feedparser
-beautifulsoup4
-numpy
-google-genai
-python-dateutil
 flask
 gunicorn

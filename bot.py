@@ -47,10 +47,16 @@ else:
     print("BOT_TOKEN znaleziony.")
 
 # --- Reszta Konfiguracji ---
-CHANNEL_ID = 1429744335389458452
+CHANNEL_ID = int(os.environ.get('CHANNEL_ID', '1429744335389458452'))
+DAILY_REPORT_HOURS = [
+    int(hour.strip())
+    for hour in os.environ.get('DAILY_REPORT_HOURS', '8').split(',')
+    if hour.strip()
+]
 VOLATILITY_ALERT_THRESHOLD = float(os.environ.get('VOLATILITY_ALERT_THRESHOLD', '5'))
 VOLATILITY_ALERT_COINS = ["bitcoin", "ethereum"]
 volatility_alert_sent = {}
+last_auto_report_key = None
 
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
 
@@ -989,7 +995,7 @@ async def on_ready():
     print(f'Zalogowano jako {bot.user}')
     try:
         # Sprawdzanie, czy taski już działają, aby uniknąć restartu
-        if not report_0800.is_running(): report_0800.start()
+        if not daily_report_loop.is_running(): daily_report_loop.start()
         if not volatility_alert_loop.is_running(): volatility_alert_loop.start()
         
         # POPRAWKA: Usunięto wywołanie fin_watch_forwarder (z Twojego kodu)
@@ -1002,12 +1008,28 @@ async def on_ready():
 
 # --- ZADANIA CYKLICZNE (tasks.loop) ---
 
-@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=TZ_POLAND))
-async def report_0800():
+@tasks.loop(minutes=1)
+async def daily_report_loop():
+    global last_auto_report_key
+    now = datetime.datetime.now(TZ_POLAND)
+    if now.hour not in DAILY_REPORT_HOURS:
+        return
+    key = now.strftime("%Y-%m-%d-%H")
+    if last_auto_report_key == key:
+        return
+
     channel = bot.get_channel(CHANNEL_ID)
-    if not channel: return
-    title = f"Profesjonalny Raport Krypto - {date.today().strftime('%d-%m-%Y')} 08:00"
-    await send_market_report(channel, title, discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_ai_analysis=True)
+    if not channel:
+        print(f"Nie znaleziono kanału raportu CHANNEL_ID={CHANNEL_ID}.")
+        return
+
+    try:
+        title = f"Profesjonalny Raport Krypto - {now.strftime('%d-%m-%Y')} {now.hour:02d}:00"
+        await send_market_report(channel, title, discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_ai_analysis=True)
+        last_auto_report_key = key
+        print(f"Raport automatyczny opublikowany dla okna {key}.")
+    except Exception as e:
+        print(f"Błąd automatycznego raportu dla okna {key}: {e}")
 
 @tasks.loop(minutes=30)
 async def volatility_alert_loop():
