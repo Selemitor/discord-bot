@@ -1,4 +1,4 @@
-﻿# Plik: bot.py
+# Plik: bot.py
 # OSTATECZNA WERSJA: Łączy Flask (dla Gunicorn) i Bota Discord (w wątku).
 
 import os
@@ -63,7 +63,7 @@ TZ_POLAND = ZoneInfo("Europe/Warsaw")
 # --- Konfiguracja Gemini (POPRAWIONA) ---
 gemini_client = None
 gemini_disabled_reason = None
-gemini_model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-pro').strip() # Domyślny model dla ANALIZ
+gemini_model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash').strip() # Domyślny model dla ANALIZ
 market_report_cache = {"timestamp": None, "text": None}
 MARKET_REPORT_CACHE_SECONDS = int(os.environ.get('MARKET_REPORT_CACHE_SECONDS', '1800'))
 gemini_safety_settings = [
@@ -731,10 +731,10 @@ def get_ai_error_message(error):
         return "Gemini API jest niedostępne z lokalizacji/regionu tej usługi. Bot użył raportu regułowego na podstawie danych rynkowych."
     if "api key" in lowered or "permission" in lowered or "unauthenticated" in lowered or "403" in error_text:
         return "Nie udało się wygenerować briefingu AI. Sprawdź `GEMINI_API_KEY` oraz dostęp tego klucza do wybranego modelu."
-    if "not found" in lowered or "404" in error_text or "model" in lowered:
-        return "Nie udało się wygenerować briefingu AI. Wybrany model Gemini może być niedostępny dla tego klucza. Ustaw `GEMINI_MODEL_NAME=gemini-2.5-flash` i wdroż ponownie."
     if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
         return "Nie udało się wygenerować briefingu AI. Limit Gemini został chwilowo wyczerpany."
+    if "not found" in lowered or "404" in error_text or "model" in lowered:
+        return "Nie udało się wygenerować briefingu AI. Wybrany model Gemini może być niedostępny dla tego klucza. Ustaw `GEMINI_MODEL_NAME=gemini-2.5-flash` i wdroż ponownie."
     if "503" in error_text or "overloaded" in lowered or "unavailable" in lowered:
         return "Nie udało się wygenerować briefingu AI. Model Gemini jest chwilowo przeciążony."
     return "Nie udało się wygenerować profesjonalnego raportu z powodu błędu Gemini. Szczegóły są w logach Render."
