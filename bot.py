@@ -853,6 +853,32 @@ def _fit_embed_value(value, limit=1024):
     return value[:limit - 3].rstrip() + "..."
 
 
+def get_channel_access_error(channel):
+    if not channel:
+        return f"Nie znaleziono kanału CHANNEL_ID={CHANNEL_ID}."
+    if not getattr(channel, "guild", None):
+        return None
+    if not bot.user:
+        return "Bot nie jest jeszcze zalogowany."
+
+    member = channel.guild.get_member(bot.user.id)
+    if not member:
+        return "Bot nie jest członkiem serwera, na którym znajduje się kanał raportu."
+
+    permissions = channel.permissions_for(member)
+    missing = []
+    if not permissions.view_channel:
+        missing.append("View Channel")
+    if not permissions.send_messages:
+        missing.append("Send Messages")
+    if not permissions.embed_links:
+        missing.append("Embed Links")
+
+    if missing:
+        return "Bot nie ma wymaganych uprawnień na kanale raportu: " + ", ".join(missing) + "."
+    return None
+
+
 async def send_market_report(channel_or_ctx,
                              title: str,
                              color: discord.Color,
@@ -899,6 +925,31 @@ async def send_market_report(channel_or_ctx,
 async def slash_report(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     await send_market_report(interaction, title="Profesjonalny briefing rynku krypto", color=discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_ai_analysis=True)
+
+
+@bot.tree.command(name="raport_status", description="Pokazuje diagnostykę automatycznego raportu.")
+async def slash_report_status(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    load_market_state()
+    channel = bot.get_channel(CHANNEL_ID)
+    access_error = get_channel_access_error(channel)
+    current_channel_error = get_channel_access_error(interaction.channel)
+    now = datetime.datetime.now(TZ_POLAND)
+    report_hour, due_key = get_due_daily_report(now)
+    daily_reports = MARKET_STATE.get("daily_reports", {})
+    latest_key = max(daily_reports.keys()) if daily_reports else "brak"
+    latest_value = daily_reports.get(latest_key, {})
+    message = (
+        f"CHANNEL_ID: `{CHANNEL_ID}`\n"
+        f"DAILY_REPORT_HOURS: `{','.join(str(h) for h in DAILY_REPORT_HOURS)}`\n"
+        f"Catch-up do godziny: `{DAILY_REPORT_CATCHUP_UNTIL_HOUR}`\n"
+        f"Dostęp do CHANNEL_ID: `{access_error or 'OK'}`\n"
+        f"Dostęp do tego kanału: `{current_channel_error or 'OK'}`\n"
+        f"Należny raport teraz: `{due_key or 'brak'}`\n"
+        f"Ostatni zapisany raport: `{latest_key}`\n"
+        f"Ostatni wysłany o: `{latest_value.get('sent_at', 'brak')}`"
+    )
+    await interaction.followup.send(message[:1900], ephemeral=True)
 
 @bot.tree.command(name="market", description="Pokazuje profesjonalny snapshot rynku krypto.")
 async def slash_market(interaction: discord.Interaction):
@@ -1063,6 +1114,11 @@ async def daily_report_loop():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         print(f"Nie znaleziono kanału raportu CHANNEL_ID={CHANNEL_ID}.")
+        return
+
+    access_error = get_channel_access_error(channel)
+    if access_error:
+        print(f"Problem dostepu do kanalu raportu: {access_error}")
         return
 
     try:
