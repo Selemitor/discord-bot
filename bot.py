@@ -276,6 +276,24 @@ def get_fear_and_greed_image():
     timestamp = int(time.time())
     return f"https://alternative.me/crypto/fear-and-greed-index.png?v={timestamp}"
 
+
+def get_fear_and_greed_status():
+    try:
+        response = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        response.raise_for_status()
+        data = response.json().get("data", [{}])[0]
+        value = data.get("value", "brak danych")
+        classification = data.get("value_classification", "brak klasyfikacji")
+        updated_at = data.get("timestamp")
+        updated_text = ""
+        if updated_at:
+            updated_dt = datetime.datetime.fromtimestamp(int(updated_at), tz=TZ_POLAND)
+            updated_text = f"\nAktualizacja: {updated_dt.strftime('%Y-%m-%d %H:%M')}"
+        return f"Indeks: **{value}/100**\nKlasyfikacja: **{classification}**{updated_text}"
+    except Exception as e:
+        print(f"Blad pobierania Fear & Greed Index: {e}")
+        return "Nie udało się pobrać aktualnej wartości indeksu."
+
 def format_usd(value, decimals=2):
     if value is None:
         return "brak danych"
@@ -891,18 +909,16 @@ async def send_market_report(channel_or_ctx,
     else:
         followup_send = channel_or_ctx.send
 
-    if include_fg:
-        fg_embed = discord.Embed(title=title, color=color)
-        fg_embed.add_field(name="Fear & Greed Index", value="Aktualny obraz sentymentu rynku.", inline=False)
-        fg_embed.set_image(url=get_fear_and_greed_image())
-        await followup_send(embed=fg_embed)
-
     main_embed = discord.Embed(
         title=title,
         description="Poranny briefing rynku krypto: sentyment, momentum, makro i ryzyka.",
         color=color
     )
     main_embed.set_footer(text=f"Dane automatyczne | Europe/Warsaw | {datetime.datetime.now(TZ_POLAND).strftime('%Y-%m-%d %H:%M')}")
+
+    if include_fg:
+        fg_text = await asyncio.to_thread(get_fear_and_greed_status)
+        main_embed.add_field(name="Fear & Greed Index", value=_fit_embed_value(fg_text, 1024), inline=False)
 
     if include_ai_analysis:
         ai_summary = await asyncio.to_thread(get_ai_report_analysis)
@@ -1012,7 +1028,8 @@ async def slash_eth(interaction: discord.Interaction):
 
 @bot.tree.command(name="fg", description="Wyświetla aktualny indeks Fear & Greed.")
 async def slash_fg(interaction: discord.Interaction):
-    embed = discord.Embed(title="Fear & Greed Index", color=discord.Color.gold())
+    status = await asyncio.to_thread(get_fear_and_greed_status)
+    embed = discord.Embed(title="Fear & Greed Index", description=status, color=discord.Color.gold())
     embed.set_image(url=get_fear_and_greed_image())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
