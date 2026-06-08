@@ -9,10 +9,12 @@ import datetime
 from datetime import date, timedelta
 import csv
 import io
+import json
 import time
 import numpy as np
 import asyncio
 import re
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from threading import Thread # <-- WAŻNE: Importujemy wątki
 from flask import Flask # <-- WAŻNE: Importujemy Flask
@@ -53,12 +55,53 @@ DAILY_REPORT_HOURS = [
     for hour in os.environ.get('DAILY_REPORT_HOURS', '8').split(',')
     if hour.strip()
 ]
+DAILY_REPORT_CATCHUP_UNTIL_HOUR = int(os.environ.get('DAILY_REPORT_CATCHUP_UNTIL_HOUR', '23'))
+MARKET_STATE_FILE = Path(os.environ.get('MARKET_STATE_FILE', 'crypto_market_state.json'))
 VOLATILITY_ALERT_THRESHOLD = float(os.environ.get('VOLATILITY_ALERT_THRESHOLD', '5'))
 VOLATILITY_ALERT_COINS = ["bitcoin", "ethereum"]
 volatility_alert_sent = {}
-last_auto_report_key = None
+MARKET_STATE = {"daily_reports": {}}
 
 TZ_POLAND = ZoneInfo("Europe/Warsaw")
+
+
+def load_market_state():
+    global MARKET_STATE
+    try:
+        if MARKET_STATE_FILE.exists():
+            MARKET_STATE = json.loads(MARKET_STATE_FILE.read_text(encoding='utf-8'))
+    except Exception as e:
+        print(f"Blad ladowania stanu market bota: {e}")
+
+
+def save_market_state():
+    try:
+        MARKET_STATE_FILE.write_text(json.dumps(MARKET_STATE, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as e:
+        print(f"Blad zapisu stanu market bota: {e}")
+
+
+def cleanup_market_state():
+    cutoff = (datetime.datetime.now(TZ_POLAND) - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+    daily_reports = MARKET_STATE.setdefault("daily_reports", {})
+    MARKET_STATE["daily_reports"] = {
+        key: value for key, value in daily_reports.items()
+        if key[:10] >= cutoff
+    }
+
+
+def get_due_daily_report(now):
+    if now.hour > DAILY_REPORT_CATCHUP_UNTIL_HOUR:
+        return None, None
+
+    daily_reports = MARKET_STATE.setdefault("daily_reports", {})
+    for report_hour in sorted(DAILY_REPORT_HOURS):
+        if now.hour < report_hour:
+            continue
+        key = f"{now.strftime('%Y-%m-%d')}-{report_hour:02d}"
+        if not daily_reports.get(key):
+            return report_hour, key
+    return None, None
 
 # --- Konfiguracja Gemini (POPRAWIONA) ---
 gemini_client = None
@@ -994,6 +1037,7 @@ async def slash_analiza_ai(interaction: discord.Interaction):
 async def on_ready():
     print(f'Zalogowano jako {bot.user}')
     try:
+        load_market_state()
         # Sprawdzanie, czy taski już działają, aby uniknąć restartu
         if not daily_report_loop.is_running(): daily_report_loop.start()
         if not volatility_alert_loop.is_running(): volatility_alert_loop.start()
@@ -1010,12 +1054,10 @@ async def on_ready():
 
 @tasks.loop(minutes=1)
 async def daily_report_loop():
-    global last_auto_report_key
     now = datetime.datetime.now(TZ_POLAND)
-    if now.hour not in DAILY_REPORT_HOURS:
-        return
-    key = now.strftime("%Y-%m-%d-%H")
-    if last_auto_report_key == key:
+    cleanup_market_state()
+    report_hour, key = get_due_daily_report(now)
+    if key is None:
         return
 
     channel = bot.get_channel(CHANNEL_ID)
@@ -1024,10 +1066,14 @@ async def daily_report_loop():
         return
 
     try:
-        title = f"Profesjonalny Raport Krypto - {now.strftime('%d-%m-%Y')} {now.hour:02d}:00"
+        title = f"Profesjonalny Raport Krypto - {now.strftime('%d-%m-%Y')} {report_hour:02d}:00"
         await send_market_report(channel, title, discord.Color.gold(), include_fg=True, include_gainers=True, include_fed=True, include_ai_analysis=True)
-        last_auto_report_key = key
-        print(f"Raport automatyczny opublikowany dla okna {key}.")
+        MARKET_STATE.setdefault("daily_reports", {})[key] = {
+            "sent_at": now.isoformat(),
+            "channel_id": CHANNEL_ID,
+        }
+        save_market_state()
+        print(f"Raport automatyczny opublikowany dla klucza {key}.")
     except Exception as e:
         print(f"Błąd automatycznego raportu dla okna {key}: {e}")
 
